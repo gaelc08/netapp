@@ -1,0 +1,110 @@
+# netapp
+
+A NetApp ONTAP volume management CLI, with optional Cohesity backup
+registration. Python port of `netapp_volume_create.sh`, restructured into
+`netapp <resource> <action>` subcommands once it grew past "just create
+volumes".
+
+## Requirements
+
+- Python 3
+- `pip install -r requirements.txt` (just `requests`, used for the ONTAP
+  REST API mode and all Cohesity calls)
+- For the default `--api ssh` mode: passwordless SSH key access to the
+  target cluster (`<cluster>.ctie.etat.lu`), the same as the original bash
+  script required.
+
+## Commands
+
+```
+netapp aggregate list     Show aggregate occupancy
+netapp volume create      Create an NFS or CIFS volume (registers it with
+                           Cohesity afterward, unless --no-backup)
+netapp volume delete      Delete a volume (and its export-policy, if safe)
+netapp volume check       Read-only ONTAP + Cohesity status report
+netapp volume backup      Register an already-existing volume with Cohesity
+                           (the recovery path after a failed/skipped backup
+                           step on 'volume create')
+```
+
+Run `netapp <command> -h` for that command's own options, or `netapp -h`
+for the full picture (auth chains, Cohesity cluster/job mapping, etc).
+
+## Examples
+
+```bash
+netapp aggregate list --user admin --cluster damascus-3
+
+netapp volume create --type nfs --user admin --cluster damascus-3 \
+    --svm svm1 --volume vol1 --size 100 --aggregate aggr1 \
+    --snap-policy CTIE_default --client-match 10.0.0.0/24 \
+    --comment 'Test volume'
+
+netapp volume delete --user admin --cluster damascus-3 --svm svm1 --volume vol1
+
+netapp volume check --user admin --cluster damascus-3 --svm svm1 --volume vol1
+```
+
+Add `--dry-run` to any of `volume create` / `volume delete` / `volume backup`
+to print what would happen without making any ONTAP or Cohesity call.
+
+## ONTAP access: `--api ssh` (default) vs `--api rest`
+
+- **`ssh`** (default) — runs the same CLI commands an admin would type by
+  hand, over an ssh connection authenticated by your own key/agent. This is
+  the fully-covered path: all five commands work.
+- **`rest`** — talks to ONTAP's REST API over HTTPS instead. Implemented
+  for `aggregate list`, `volume create` (NFS and CIFS, including the
+  tiering-policy PATCH, the mount step, and home-directory quota for CIFS),
+  and `volume delete`, using async job polling where ONTAP requires it.
+  `volume check` is not yet ported and rejects `--api rest`.
+
+  Authentication for `--api rest`, tried in this order:
+  1. **Client certificate**, if configured: `--cert-file`/`--key-file` (or
+     `$ONTAP_CERT_FILE`/`$ONTAP_KEY_FILE`). The cert must already be
+     installed in ONTAP and mapped to a user (`security login create
+     -authmethod cert -application http`).
+  2. **HTTP basic auth** otherwise: `--user` plus `--password` (or
+     `$ONTAP_PASSWORD`, or a hidden prompt if neither is given).
+
+  TLS is verified by default. Most intranet clusters present a
+  self-signed/internal-CA cert, so you'll likely need either
+  `--ca-bundle <path-to-your-CA>` or, for quick testing only,
+  `--insecure-ontap`.
+
+## Cohesity backup
+
+On by default after `volume create` (`--no-backup` to skip), and available
+standalone via `volume backup` for retrying a registration that failed the
+first time. Auth is `--cohesity-apikey`, or `$COHESITY_APIKEY`, or a hidden
+prompt.
+
+The Cohesity cluster and job name are derived from `--cluster` and
+`--backup-tier`:
+
+| `--cluster`            | Cohesity cluster | Job name pattern              |
+|-------------------------|------------------|--------------------------------|
+| `damascus-3`, `jericho-1` | `closluce-1`    | `<Cluster>-<Tier>Term-DC1`     |
+| `damascus-4`, `jericho-2` | `closluce-2`    | `<Cluster>-<Tier>Term-CS3`     |
+
+For any other cluster, pass both `--cohesity-cluster` and `--cohesity-job`
+explicitly, or backup registration is skipped with a warning.
+
+## Snapshot policies
+
+Valid values for `--snap-policy`: `CTIE_daily`, `CTIE_daily_315`,
+`CTIE_default`, `CTIE_heavy`, `CTIE_light`, `CTIE_medium`,
+`CTIE_one_weekly`, `CTIE_Prod`, `none`.
+
+`CTIE_Prod` (hourly x24, daily x31, weekly x4) is CIFS-only by convention -
+`volume create --type nfs --snap-policy CTIE_Prod` is rejected before any
+ONTAP call is made.
+
+## Known gaps
+
+- `volume check` doesn't have a REST implementation yet - it always uses
+  ssh regardless of `--api`.
+- The REST path (`--api rest`) has been tested against a real ONTAP
+  cluster for `aggregate list`, `volume create`, and `volume delete`, but
+  not exhaustively - review `--dry-run` output before trusting it for a
+  case this hasn't seen yet.
