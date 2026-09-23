@@ -2,7 +2,7 @@
 """netapp_volume_create.py
 
 Python port of netapp_volume_create.sh.
-Version: 2026-09-23-02 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
+Version: 2026-09-23-04 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
 """
 
 import argparse
@@ -22,7 +22,7 @@ try:
 except ImportError:
     HAVE_REQUESTS = False
 
-SCRIPT_VERSION = "2026-09-23-03"
+SCRIPT_VERSION = "2026-09-23-04"
 
 # LIF addresses on this network are reserved for Cohesity backup traffic
 # and must never be handed out to clients as a mount target - excluded
@@ -98,10 +98,16 @@ looking up an existing volume before a delete, or SVM LIF addresses for the
 client access info block) still run for real, since they make no changes.
 
 --api <ssh|rest> selects how ONTAP itself is reached. ssh (the default) runs
-the same CLI commands an admin would type by hand - this is the only fully
-implemented path. rest talks to ONTAP's REST API over HTTPS instead, but is
-currently only implemented for --list-aggregates; every other mode rejects
---api rest until its REST calls are verified against a real cluster.
+the same CLI commands an admin would type by hand. rest talks to ONTAP's
+REST API over HTTPS instead - implemented for --list-aggregates, volume
+creation (NFS and CIFS, including the tiering-policy PATCH, the mount step
+and home-directory quota for CIFS), and --delete, using async job polling
+where ONTAP requires it (volume create/mount/offline/delete, quota rule
+create). --check is not yet ported to REST and rejects --api rest for now.
+Endpoints and field names were taken directly from the ONTAP REST OpenAPI
+spec, not guessed - still worth a --dry-run pass against a real cluster
+before trusting it in production, since it hasn't been exercised against
+live ONTAP from this environment.
 
 ONTAP REST authentication (only relevant with --api rest), tried in order:
           1. Client certificate, if configured:
@@ -215,9 +221,13 @@ def resolve_ontap_auth(args):
 
 
 def ontap_rest_request(args, method, path, **kwargs):
-    """Issues one ONTAP REST call against --cluster. TLS is verified by
-    default; pass --ca-bundle for an internal/self-signed CA, or
-    --insecure-ontap to skip verification (not recommended)."""
+    """Issues one raw ONTAP REST call against --cluster and returns the
+    requests.Response. TLS is verified by default; pass --ca-bundle for an
+    internal/self-signed CA, or --insecure-ontap to skip verification (not
+    recommended). Raises requests.RequestException on a connection-level
+    failure (DNS/connect/timeout/TLS) - callers use ontap_rest_json(), which
+    catches that the same way ssh_capture() lets a failed ssh command return
+    a non-zero exit code instead of crashing the script."""
     if not HAVE_REQUESTS:
         error_exit("Python 'requests' package not found - required for --api rest (pip install requests)")
 
@@ -228,23 +238,143 @@ def ontap_rest_request(args, method, path, **kwargs):
         verify = getattr(args, "ontap_ca_bundle", None) or True
 
     url = f"https://{remote_host(args.cluster)}/api{path}"
+    return requests.request(method, url, timeout=30, verify=verify, headers={"Accept": "application/json"}, **auth_kwargs, **kwargs)
+
+
+def ontap_rest_json(args, method, path, **kwargs):
+    """Returns (status_code, body_dict). status_code is 0 (with a "message"
+    in body) if the request itself could not be sent at all - callers treat
+    that the same as any other non-2xx failure, mirroring how a failed ssh
+    connection just shows up as a non-zero ssh_capture().returncode."""
     try:
-        return requests.request(method, url, timeout=30, verify=verify, headers={"Accept": "application/json"}, **auth_kwargs, **kwargs)
+        resp = ontap_rest_request(args, method, path, **kwargs)
     except requests.RequestException as exc:
-        error_exit(f"ONTAP REST request to {url} failed: {exc}")
+        return 0, {"message": str(exc)}
+    try:
+        body = resp.json() if resp.content else {}
+    except ValueError:
+        body = {"message": resp.text}
+    return resp.status_code, body
+
+
+def wait_for_ontap_job(args, body, description):
+    """Many ONTAP REST mutations are asynchronous: a successful call returns
+    {"job": {"uuid": ..., "_links": {"self": {"href": "/api/cluster/jobs/..."}}}}
+    immediately, and the actual work happens in that job. Polls it (job
+    states: queued/running/paused/success/failure) until it settles. A
+    response with no "job" key was synchronous (e.g. export-policy create),
+    so there's nothing to wait for. Returns (ok, error_message_or_None)."""
+    job = (body or {}).get("job")
+    if not job:
+        return True, None
+    href = (job.get("_links") or {}).get("self", {}).get("href") or f"/cluster/jobs/{job.get('uuid')}"
+    path = href[4:] if href.startswith("/api/") else href
+    print(f"[INFO] {description}: waiting for ONTAP job {job.get('uuid')}...")
+    for _ in range(120):
+        status, jbody = ontap_rest_json(args, "GET", path)
+        if status != 200:
+            return False, f"could not poll job status (HTTP {status}): {jbody.get('message', '')}"
+        state = jbody.get("state")
+        if state == "success":
+            return True, None
+        if state == "failure":
+            err = (jbody.get("error") or {}).get("message") or jbody.get("message") or "job failed"
+            return False, err
+        time.sleep(2)
+    return False, "job did not complete within timeout (240s)"
+
+
+def rest_step(args, description, method, path, json_body=None, params=None):
+    """REST equivalent of run_step(): issues one mutating ONTAP REST call,
+    waits for its job to finish if it started one, and returns (success,
+    response_body). In --dry-run mode, prints what would be sent instead of
+    sending it and simulates success, exactly like run_step()."""
+    print(f"[INFO] {description}...")
+    if getattr(args, "dry_run", False):
+        print(f"[DRY-RUN] Would {method} {path} params={params or {}} body={json_body}")
+        return True, {}
+    call_params = dict(params or {})
+    if method == "POST":
+        call_params.setdefault("return_records", "true")
+    status, body = ontap_rest_json(args, method, path, params=call_params, json=json_body)
+    if status not in (200, 201, 202):
+        detail = body.get("message") if isinstance(body, dict) else body
+        print(f"[ERROR-DETAIL] HTTP {status}: {detail}", file=sys.stderr)
+        return False, body
+    ok, err = wait_for_ontap_job(args, body, description)
+    if not ok:
+        print(f"[ERROR-DETAIL] {err}", file=sys.stderr)
+        return False, body
+    return True, body
+
+
+# REST rollback stack: (description, zero-arg callable) pairs, run in
+# reverse order on failure - the REST equivalent of ROLLBACK_STEPS/
+# push_rollback()/run_rollback(), which replay raw ssh commands instead.
+ROLLBACK_STEPS_REST = []
+
+
+def push_rollback_rest(description, fn):
+    ROLLBACK_STEPS_REST.append((description, fn))
+
+
+def run_rollback_rest(args):
+    if not ROLLBACK_STEPS_REST:
+        return
+    print(f"[WARN] Rolling back {len(ROLLBACK_STEPS_REST)} already-completed step(s) on {args.cluster}...", file=sys.stderr)
+    while ROLLBACK_STEPS_REST:
+        description, fn = ROLLBACK_STEPS_REST.pop()
+        print(f"[WARN] Rollback: {description}", file=sys.stderr)
+        try:
+            ok = fn()
+        except Exception as exc:
+            ok = False
+            print(f"[WARN] Rollback step raised an error: {exc}", file=sys.stderr)
+        if not ok:
+            print(f"[WARN] Rollback step itself failed - MANUAL CLEANUP NEEDED on {args.cluster}: {description}", file=sys.stderr)
+
+
+def get_volume_rest(args, volume_name, fields):
+    """Looks up one volume by name+svm and returns its record dict (with
+    only the requested fields populated), or None if not found."""
+    status, body = ontap_rest_json(
+        args, "GET", "/storage/volumes",
+        params={"name": volume_name, "svm.name": args.svm_name, "fields": ",".join(fields)},
+    )
+    if status != 200:
+        return None
+    records = body.get("records") or []
+    return records[0] if records else None
+
+
+def get_svm_lifs_rest(args):
+    status, body = ontap_rest_json(
+        args, "GET", "/network/ip/interfaces",
+        params={"svm.name": args.svm_name, "fields": "ip.address"},
+    )
+    if status != 200:
+        return []
+    return [rec["ip"]["address"] for rec in body.get("records", []) if (rec.get("ip") or {}).get("address")]
+
+
+def get_svm_lifs(args):
+    if getattr(args, "api_mode", "ssh") == "rest":
+        return get_svm_lifs_rest(args)
+    rows = get_ontap_fields(args.user, args.cluster, f"net interface show -vserver {args.svm_name}", ["address"])
+    return [row[0] for row in rows if row[0]]
 
 
 def list_aggregates_rest(args):
     """REST equivalent of "storage aggregate show", using the well-documented
     GET /api/storage/aggregates collection endpoint."""
-    resp = ontap_rest_request(
+    status, body = ontap_rest_json(
         args, "GET", "/storage/aggregates",
         params={"fields": "space.block_storage.size,space.block_storage.available,space.block_storage.used,state,volume_count"},
     )
-    if resp.status_code != 200:
-        error_exit(f"Could not fetch aggregate list from {args.cluster} (HTTP {resp.status_code}): {resp.text}")
+    if status != 200:
+        error_exit(f"Could not fetch aggregate list from {args.cluster} (HTTP {status}): {body.get('message', '')}")
 
-    records = resp.json().get("records", [])
+    records = body.get("records", [])
     lines = [f"{'Aggregate':<20}{'Size':>14}{'Available':>14}{'Used':>14}  {'State':<10}{'Vols':>6}"]
     for rec in records:
         block = (rec.get("space") or {}).get("block_storage") or {}
@@ -432,14 +562,17 @@ def print_client_access_info(args, protocol, mount_path, policy_for_lookup=None)
     print(" Client access information")
     print("============================================")
 
-    all_lifs_rows = get_ontap_fields(args.user, args.cluster, f"net interface show -vserver {args.svm_name}", ["address"])
-    all_lifs = [row[0] for row in all_lifs_rows if row[0]]
+    all_lifs = get_svm_lifs(args)
     lifs = [ip for ip in all_lifs if not ip.startswith(COHESITY_BACKUP_NETWORK_PREFIX)]
     lifs_str = " ".join(lifs)
 
     if not all_lifs:
-        print("  Could not determine the NAS server address automatically - check manually:")
-        print(f'    ssh -l {args.user} {remote_host(args.cluster)} "net interface show -vserver {args.svm_name} -fields address"')
+        if getattr(args, "api_mode", "ssh") == "rest":
+            print("  Could not determine the NAS server address automatically - check manually:")
+            print(f"    GET https://{remote_host(args.cluster)}/api/network/ip/interfaces?svm.name={args.svm_name}&fields=ip.address")
+        else:
+            print("  Could not determine the NAS server address automatically - check manually:")
+            print(f'    ssh -l {args.user} {remote_host(args.cluster)} "net interface show -vserver {args.svm_name} -fields address"')
     elif not lifs:
         print(f"  No client-facing NAS server address available for {args.svm_name} - check the SVM's LIF configuration.")
     else:
@@ -656,6 +789,266 @@ def delete_volume(args):
 
     if not run_step(args, f"Deleting export-policy {policy_name}",
                      f"export-policy delete -vserver {args.svm_name} -policyname {policy_name}"):
+        print(f"[WARN] Could not delete export-policy '{policy_name}' - may need manual cleanup on {args.cluster}.", file=sys.stderr)
+    else:
+        print(f"[INFO] Export-policy '{policy_name}' deleted.")
+
+
+# ── ONTAP REST volume create/delete (--api rest) ────────────────────────────
+# Endpoints, required/optional fields, and the async-job pattern below were
+# read directly out of the ONTAP REST OpenAPI spec (POST/PATCH/DELETE
+# /storage/volumes, /protocols/nfs/export-policies(/rules), /storage/quota/
+# rules, /network/ip/interfaces, /cluster/jobs/{uuid}), not guessed - see the
+# field-by-field notes in the commit that introduced these functions.
+
+def create_nfs_volume_rest(args, size_num, size_unit):
+    if args.snap_policy == "none":
+        vol_size_calculated = f"{size_num}{size_unit}"
+        snapshot_reserve = 0
+    else:
+        padded = float(size_num) * 10 / 9
+        vol_size_calculated = f"{padded:.2f}{size_unit}"
+        snapshot_reserve = 10
+
+    jct_path = f"/{args.volume_name}"
+
+    print(f"[INFO] Creating NFS volume {args.volume_name}...")
+
+    ok, body = rest_step(
+        args, f"Creating export policy {args.export_policy}", "POST",
+        "/protocols/nfs/export-policies",
+        json_body={"name": args.export_policy, "svm": {"name": args.svm_name}},
+    )
+    if not ok:
+        error_exit("Failed to create export policy - nothing was created, aborting.")
+
+    policy_id = None
+    if not args.dry_run:
+        records = body.get("records") or []
+        policy_id = records[0]["id"] if records else None
+        if policy_id is None:
+            error_exit("Export policy was created but its id was not returned by ONTAP - cannot continue.")
+
+    push_rollback_rest(
+        f"delete export-policy {args.export_policy}",
+        lambda: rest_step(args, f"Rollback: delete export-policy {args.export_policy}", "DELETE",
+                           f"/protocols/nfs/export-policies/{policy_id}")[0],
+    )
+
+    rule_path = f"/protocols/nfs/export-policies/{policy_id if policy_id is not None else '<policy-id>'}/rules"
+    ok, _ = rest_step(
+        args, f"Creating export policy rule for {args.client_match}", "POST", rule_path,
+        json_body={
+            "clients": [{"match": args.client_match}],
+            "ro_rule": ["any"], "rw_rule": ["any"],
+            "protocols": ["nfs4"], "superuser": ["sys"],
+        },
+    )
+    if not ok:
+        run_rollback_rest(args)
+        error_exit(f"Failed to create export policy rule - rolled back, nothing left over on {args.cluster}.")
+
+    volume_body = {
+        "name": args.volume_name,
+        "svm": {"name": args.svm_name},
+        "aggregates": [{"name": args.aggregate}],
+        "size": vol_size_calculated,
+        "state": "online",
+        "comment": args.comment,
+        "nas": {"export_policy": {"name": args.export_policy}, "path": jct_path},
+        "snapshot_policy": {"name": args.snap_policy},
+        "space": {
+            "snapshot": {"reserve_percent": snapshot_reserve},
+            "logical_space": {"enforcement": True, "reporting": True},
+        },
+        "guarantee": {"type": "none"},
+    }
+    ok, _ = rest_step(args, f"Creating volume {args.volume_name}", "POST", "/storage/volumes", json_body=volume_body)
+    if not ok:
+        run_rollback_rest(args)
+        error_exit(f"Failed to create volume - rolled back, nothing left over on {args.cluster}.")
+
+    # movement.tiering_policy is marked modify-only in the ONTAP schema (it
+    # can't be set in the create body), so it needs a follow-up PATCH.
+    if args.tiering_policy:
+        if args.dry_run:
+            print(f"[DRY-RUN] Would set tiering policy to {args.tiering_policy} after creation.")
+        else:
+            vol = get_volume_rest(args, args.volume_name, ["uuid"])
+            if vol and vol.get("uuid"):
+                rest_step(args, f"Setting tiering policy {args.tiering_policy}", "PATCH",
+                          f"/storage/volumes/{vol['uuid']}",
+                          json_body={"movement": {"tiering_policy": args.tiering_policy}})
+            else:
+                print("[WARN] Volume created but could not be looked up afterward to set --tiering-policy - set it manually.", file=sys.stderr)
+
+    print(f"[INFO] Volume {args.volume_name} created successfully.")
+    print(f"[INFO] Junction-path: {jct_path}")
+
+    print_client_access_info(args, "nfs", jct_path, args.export_policy)
+
+
+def create_cifs_volume_rest(args, size_num, size_unit):
+    padded = float(size_num) * 10 / 9
+    vol_size_calculated = f"{padded:.2f}{size_unit}"
+
+    print(f"[INFO] Creating CIFS volume {args.volume_name}...")
+
+    volume_body = {
+        "name": args.volume_name,
+        "svm": {"name": args.svm_name},
+        "aggregates": [{"name": args.aggregate}],
+        "size": vol_size_calculated,
+        "state": "online",
+        "comment": args.comment,
+        "nas": {"security_style": "ntfs"},
+        "snapshot_policy": {"name": args.snap_policy},
+        "space": {
+            "snapshot": {"reserve_percent": 10},
+            "logical_space": {"enforcement": True, "reporting": True},
+        },
+        "guarantee": {"type": "none"},
+    }
+    ok, _ = rest_step(args, f"Creating volume {args.volume_name}", "POST", "/storage/volumes", json_body=volume_body)
+    if not ok:
+        error_exit("Failed to create volume - nothing was created, aborting.")
+
+    def _rollback_delete_volume():
+        vol = get_volume_rest(args, args.volume_name, ["uuid"])
+        if not vol:
+            return False
+        vol_uuid = vol["uuid"]
+        ok1, _ = rest_step(args, f"Rollback: taking volume {args.volume_name} offline", "PATCH",
+                            f"/storage/volumes/{vol_uuid}", json_body={"state": "offline"})
+        ok2, _ = rest_step(args, f"Rollback: deleting volume {args.volume_name}", "DELETE",
+                            f"/storage/volumes/{vol_uuid}")
+        return ok1 and ok2
+
+    push_rollback_rest(f"offline+delete volume {args.volume_name}", _rollback_delete_volume)
+
+    volume_uuid = None
+    if not args.dry_run:
+        vol = get_volume_rest(args, args.volume_name, ["uuid"])
+        volume_uuid = vol["uuid"] if vol else None
+        if not volume_uuid:
+            run_rollback_rest(args)
+            error_exit(f"Volume was created but could not be looked up afterward on {args.cluster} - rolled back.")
+
+    if args.tiering_policy:
+        if args.dry_run:
+            print(f"[DRY-RUN] Would set tiering policy to {args.tiering_policy} after creation.")
+        else:
+            rest_step(args, f"Setting tiering policy {args.tiering_policy}", "PATCH", f"/storage/volumes/{volume_uuid}",
+                      json_body={"movement": {"tiering_policy": args.tiering_policy}})
+
+    print("[INFO] Waiting for operations to complete...")
+
+    mount_path = f"/storage/volumes/{volume_uuid if volume_uuid else '<volume-uuid>'}"
+    ok, _ = rest_step(args, f"Mounting volume at {args.junction_path}", "PATCH", mount_path,
+                       json_body={"nas": {"path": args.junction_path}})
+    if not ok:
+        run_rollback_rest(args)
+        error_exit(f"Failed to mount volume - rolled back (volume deleted), nothing left over on {args.cluster}.")
+
+    # Home-directory volumes get a default 15GB per-user quota
+    if args.volume_name.startswith("home"):
+        print("[INFO] Volume name starts with 'home' - applying default 15GB user quota...")
+
+        ok, _ = rest_step(
+            args, "Creating quota rule (15GB per user)", "POST", "/storage/quota/rules",
+            json_body={
+                "svm": {"name": args.svm_name}, "volume": {"name": args.volume_name},
+                "type": "user", "users": [{"name": ""}], "qtree": {"name": ""},
+                "space": {"hard_limit": 15 * 1024 * 1024 * 1024},
+            },
+        )
+        if not ok:
+            run_rollback_rest(args)
+            error_exit(f"Failed to create quota rule - rolled back (volume deleted), nothing left over on {args.cluster}.")
+
+        ok, _ = rest_step(args, "Enabling quota", "PATCH", mount_path, json_body={"quota": {"enabled": True}})
+        if not ok:
+            run_rollback_rest(args)
+            error_exit(f"Failed to enable quota - rolled back (volume deleted), nothing left over on {args.cluster}.")
+        # ONTAP REST has no separate "quota resize" action - enabling quota
+        # (above) triggers the equivalent recalculation as part of its job,
+        # unlike the CLI's two distinct "quota on" / "quota resize" steps.
+        print("[INFO] Quota set for home volume.")
+
+    print(f"[INFO] Volume {args.volume_name} created and mounted successfully.")
+    print(f"[INFO] Junction-path: {args.junction_path}")
+
+    print_client_access_info(args, "cifs", args.junction_path)
+
+
+def delete_volume_rest(args):
+    print(f"[INFO] Looking up volume {args.volume_name} on {args.svm_name} ({args.cluster})...")
+    vol = get_volume_rest(args, args.volume_name,
+                           ["uuid", "nas.export_policy.name", "nas.export_policy.id", "nas.path"])
+    if not vol:
+        error_exit(f"Could not find volume '{args.volume_name}' on vserver '{args.svm_name}' - aborting, nothing touched.")
+
+    volume_uuid = vol["uuid"]
+    nas = vol.get("nas") or {}
+    policy = nas.get("export_policy") or {}
+    policy_name = policy.get("name") or ""
+    policy_id = policy.get("id")
+    jpath = nas.get("path") or "-"
+
+    print(f"[INFO] Found volume '{args.volume_name}' - export-policy: '{policy_name or '-'}', junction-path: '{jpath}'.")
+
+    if args.dry_run:
+        print(f"[DRY-RUN] Would prompt to confirm deletion of '{args.volume_name}', then run the steps below.")
+    elif not args.assume_yes:
+        print("")
+        confirm = input(
+            f"Delete volume '{args.volume_name}' on {args.svm_name} ({args.cluster})? This is IRREVERSIBLE. Type DELETE to confirm: "
+        )
+        if confirm != "DELETE":
+            print("Aborted. Nothing was touched.")
+            sys.exit(0)
+
+    if jpath and jpath != "-":
+        ok, _ = rest_step(args, "Unmounting volume", "PATCH", f"/storage/volumes/{volume_uuid}",
+                           json_body={"nas": {"path": ""}})
+        if not ok:
+            error_exit("Failed to unmount volume - aborting before delete, nothing else touched.")
+
+    ok, _ = rest_step(args, "Taking volume offline", "PATCH", f"/storage/volumes/{volume_uuid}",
+                       json_body={"state": "offline"})
+    if not ok:
+        error_exit("Failed to take volume offline - aborting before delete.")
+
+    ok, _ = rest_step(args, "Deleting volume", "DELETE", f"/storage/volumes/{volume_uuid}")
+    if not ok:
+        error_exit(f"Failed to delete volume. It is now offline but still present - check manually on {args.cluster}.")
+
+    print(f"[INFO] Volume '{args.volume_name}' deleted.")
+
+    if not policy_name or policy_name in ("default", "none"):
+        print(f"[INFO] Export-policy '{policy_name or '-'}' is a built-in ONTAP policy or unknown - not touching it.")
+        return
+
+    # Safety check: only delete the export-policy if no OTHER volume on
+    # this vserver still references it.
+    status, body = ontap_rest_json(args, "GET", "/storage/volumes",
+                                    params={"svm.name": args.svm_name, "fields": "name,nas.export_policy.name"})
+    other_users = []
+    if status == 200:
+        for rec in body.get("records") or []:
+            rec_policy = ((rec.get("nas") or {}).get("export_policy") or {}).get("name")
+            if rec_policy == policy_name:
+                other_users.append(rec.get("name"))
+
+    if other_users:
+        print(f"[WARN] Export-policy '{policy_name}' is still used by other volume(s) on {args.svm_name} - NOT deleting it:")
+        for v in other_users:
+            print(f"  - {v}")
+        return
+
+    ok, _ = rest_step(args, f"Deleting export-policy {policy_name}", "DELETE",
+                       f"/protocols/nfs/export-policies/{policy_id}")
+    if not ok:
         print(f"[WARN] Could not delete export-policy '{policy_name}' - may need manual cleanup on {args.cluster}.", file=sys.stderr)
     else:
         print(f"[INFO] Export-policy '{policy_name}' deleted.")
@@ -1108,8 +1501,9 @@ def main(argv=None):
     if args.delete_mode:
         require_args(args, ["user", "cluster", "svm_name", "volume_name"])
         if args.api_mode == "rest":
-            error_exit("--api rest is currently only implemented for --list-aggregates; use --api ssh (the default) for --delete.")
-        delete_volume(args)
+            delete_volume_rest(args)
+        else:
+            delete_volume(args)
         sys.exit(0)
 
     # --backup-only: register an ALREADY-EXISTING volume with Cohesity and
@@ -1130,16 +1524,13 @@ def main(argv=None):
     if args.check_mode:
         require_args(args, ["user", "cluster", "svm_name", "volume_name"])
         if args.api_mode == "rest":
-            error_exit("--api rest is currently only implemented for --list-aggregates; use --api ssh (the default) for --check.")
+            error_exit("--api rest is not yet implemented for --check; use --api ssh (the default) for --check.")
         check_volume_status(args)
         sys.exit(0)
 
     # Validate required arguments (aggregate is NOT required here - if
     # missing, we prompt interactively below instead of failing)
     require_args(args, ["volume_type", "user", "cluster", "svm_name", "volume_name", "vol_size", "snap_policy"])
-
-    if args.api_mode == "rest":
-        error_exit("--api rest is currently only implemented for --list-aggregates; use --api ssh (the default) for volume creation.")
 
     # Parse --size into size_num / size_unit (accepts "100" or "100GB")
     size_num, size_unit = parse_size(args.vol_size)
@@ -1150,7 +1541,14 @@ def main(argv=None):
 
     validate_inputs(args)
 
-    if args.volume_type == "nfs":
+    if args.api_mode == "rest":
+        if args.volume_type == "nfs":
+            create_nfs_volume_rest(args, size_num, size_unit)
+        elif args.volume_type == "cifs":
+            create_cifs_volume_rest(args, size_num, size_unit)
+        else:
+            error_exit(f"--type must be nfs or cifs (got '{args.volume_type}')")
+    elif args.volume_type == "nfs":
         create_nfs_volume(args, size_num, size_unit)
     elif args.volume_type == "cifs":
         create_cifs_volume(args, size_num, size_unit)
