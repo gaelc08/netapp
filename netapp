@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""netapp_volume_create.py
+"""netapp
 
-Python port of netapp_volume_create.sh.
-Version: 2026-09-23-05 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
+NetApp ONTAP volume management CLI ("netapp <resource> <action>"), with
+optional Cohesity backup registration. Originally a straight Python port of
+netapp_volume_create.sh; restructured from single-purpose flags (--delete,
+--check, --backup-only, --list-aggregates) into subcommands once it grew
+past "just create volumes".
+Version: 2026-09-23-06 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
 """
 
 import argparse
@@ -22,7 +26,7 @@ try:
 except ImportError:
     HAVE_REQUESTS = False
 
-SCRIPT_VERSION = "2026-09-23-05"
+SCRIPT_VERSION = "2026-09-23-06"
 
 # LIF addresses on this network are reserved for Cohesity backup traffic
 # and must never be handed out to clients as a mount target - excluded
@@ -53,103 +57,91 @@ def error_exit(message):
     sys.exit(1)
 
 
-EPILOG = """\
---size accepts a bare number (assumed GB, e.g. 100) or a number with a unit
-attached (e.g. 100GB, 2TB). Valid units: B, KB, MB, GB, TB, PB.
+TOP_DESCRIPTION = """\
+NetApp ONTAP volume management, with optional Cohesity backup registration.
 
---aggregate is optional. If omitted, the script fetches aggregate occupancy
-(size, available, used%%, #vols) from --cluster and prompts you to pick one.
+Commands:
+  netapp aggregate list     Show aggregate occupancy
+  netapp volume create      Create an NFS or CIFS volume (registers it with
+                             Cohesity afterward, unless --no-backup)
+  netapp volume delete      Delete a volume (and its export-policy, if safe)
+  netapp volume check       Read-only ONTAP + Cohesity status report
+  netapp volume backup      Register an already-existing volume with Cohesity
+                             (the recovery path after a failed/skipped backup
+                             step on 'volume create' - do NOT re-run the full
+                             create in that case, it fails on 'export-policy
+                             already exists')
 
-Also: %(prog)s --list-aggregates --user <username> --cluster <source_cluster>
-      Just prints aggregate occupancy for --cluster and exits, no volume created.
+Run 'netapp <command> -h' for that command's own options."""
 
-Also: %(prog)s --delete --user <username> --cluster <source_cluster> --svm <svm_name> --volume <volume_name>
-      Deletes a volume (unmounting first if needed) and, if safe (no other
-      volume on the vserver still uses the same export-policy), deletes its
-      export-policy too. Asks for confirmation (type DELETE) unless --yes.
+TOP_EPILOG = """\
+Notes that apply across commands:
 
-Also: %(prog)s --backup-only --cluster <source_cluster> --svm <svm_name> --volume <volume_name>
-      [--backup-tier <short|mid|long|none>] [--cohesity-apikey <key>] ...
-      Registers an ALREADY-EXISTING volume with Cohesity and exits - no ONTAP
-      call is made, --user is not required. Use this to retry Cohesity
-      registration after a volume was created successfully but the backup
-      step failed (wrong API key, job not found yet, etc) - do NOT re-run the
-      full create command in that case, it will fail on 'export-policy exists'.
+--size (volume create) accepts a bare number (assumed GB, e.g. 100) or a
+number with a unit attached (e.g. 100GB, 2TB). Valid units: B, KB, MB, GB,
+TB, PB.
 
-Also: %(prog)s --check --user <username> --cluster <source_cluster> --svm <svm_name> --volume <volume_name>
-      [--type <nfs|cifs>] [--cohesity-apikey <key>] [--cohesity-cluster <name>] ...
-      Read-only status report: ONTAP state/mount/export-policy rules, plus
-      Cohesity discovery + which protection job(s), if any, protect it, plus
-      client access info (SVM LIF address(es), mount point, firewall reminder).
-      --type is optional here - if omitted it's inferred from security-style,
-      pass it explicitly to be sure. Makes NO changes anywhere - safe to run
-      any time.
+--aggregate (volume create) is optional. If omitted, the script fetches
+aggregate occupancy from --cluster and prompts you to pick one.
 
---tiering-policy is optional and OMITTED by default (volume keeps the aggregate's
-own tiering behavior). Only pass it on FabricPool-enabled aggregates/clusters -
-ONTAP rejects -tiering-policy on an aggregate with no object store attached.
+--tiering-policy (volume create) is optional and OMITTED by default (volume
+keeps the aggregate's own tiering behavior). Only pass it on FabricPool-
+enabled aggregates/clusters - ONTAP rejects it on an aggregate with no
+object store attached.
 
---dry-run works with volume creation, --delete, and --backup-only. It prints
-every ONTAP command that would be run (and, for --delete, skips the
-confirmation prompt) instead of sending it over ssh, and skips all Cohesity
-API calls entirely - it just prints which job the volume would be registered
-to, so no Cohesity API key is needed for a dry run. Read-only lookups (e.g.
-looking up an existing volume before a delete, or SVM LIF addresses for the
-client access info block) still run for real, since they make no changes.
+--dry-run (volume create/delete/backup) prints every ONTAP command that
+would be run (and, for delete, skips the confirmation prompt) instead of
+sending it, and skips all Cohesity API calls entirely - it just prints
+which job the volume would be registered to, so no Cohesity API key is
+needed for a dry run. Read-only lookups (e.g. looking up an existing volume
+before a delete, or SVM LIF addresses for the client access info block)
+still run for real, since they make no changes.
 
 --api <ssh|rest> selects how ONTAP itself is reached. ssh (the default) runs
 the same CLI commands an admin would type by hand. rest talks to ONTAP's
-REST API over HTTPS instead - implemented for --list-aggregates, volume
-creation (NFS and CIFS, including the tiering-policy PATCH, the mount step
-and home-directory quota for CIFS), and --delete, using async job polling
-where ONTAP requires it (volume create/mount/offline/delete, quota rule
-create). --check is not yet ported to REST and rejects --api rest for now.
-Endpoints and field names were taken directly from the ONTAP REST OpenAPI
-spec, not guessed - still worth a --dry-run pass against a real cluster
-before trusting it in production, since it hasn't been exercised against
-live ONTAP from this environment.
+REST API over HTTPS instead - implemented for aggregate list, volume create
+(NFS and CIFS, including the tiering-policy PATCH, the mount step and
+home-directory quota for CIFS), and volume delete, using async job polling
+where ONTAP requires it. volume check is not yet ported to REST and rejects
+--api rest for now.
 
 ONTAP REST authentication (only relevant with --api rest), tried in order:
-          1. Client certificate, if configured:
-             [--cert-file <path>] [--key-file <path>]
-             (or $ONTAP_CERT_FILE / $ONTAP_KEY_FILE) - both are required
-             together. The certificate must already be installed in ONTAP
-             and mapped to a user (security login create -authmethod cert).
-          2. HTTP basic auth otherwise, using --user plus:
-             [--password <password>]           (falls back to $ONTAP_PASSWORD, then a prompt)
-          [--ca-bundle <path>]                  (trust a private/internal CA; default is normal TLS verification)
-          [--insecure-ontap]                    (skip TLS verification entirely - not recommended)
+  1. Client certificate, if configured: [--cert-file <path>] [--key-file <path>]
+     (or $ONTAP_CERT_FILE / $ONTAP_KEY_FILE) - both required together. The
+     certificate must already be installed in ONTAP and mapped to a user
+     (security login create -authmethod cert).
+  2. HTTP basic auth otherwise, using --user plus [--password <password>]
+     (falls back to $ONTAP_PASSWORD, then a hidden prompt).
+  [--ca-bundle <path>]     trust a private/internal CA (default: normal TLS verification)
+  [--insecure-ontap]       skip TLS verification entirely - not recommended
 
-Cohesity backup (on by default after volume creation, use --no-backup to skip):
-          [--backup-tier <short|mid|long|none>]   (prompted interactively if omitted; 'none' = skip)
-          [--cohesity-apikey <apikey>]        (falls back to $COHESITY_APIKEY, then a prompt)
-          [--cohesity-cluster <name>]         (override auto-detected Cohesity cluster)
-          [--cohesity-job <name>]             (override auto-built job name)
-          [--no-backup]                       (skip Cohesity protection entirely)
+Cohesity backup (volume create/check/backup):
+  [--backup-tier <short|mid|long|none>]   prompted interactively if omitted; 'none' = skip
+  [--cohesity-apikey <apikey>]            falls back to $COHESITY_APIKEY, then a prompt
+  [--cohesity-cluster <name>]             override auto-detected Cohesity cluster
+  [--cohesity-job <name>]                 override auto-built job name
+  [--no-backup]                           (create only) skip Cohesity protection entirely
 
 The Cohesity cluster and job name are derived from --cluster and --backup-tier:
   damascus-3, jericho-1 -> closluce-1, job '<Cluster>-<Tier>Term-DC1'
   damascus-4, jericho-2 -> closluce-2, job '<Cluster>-<Tier>Term-CS3'
-For any other --cluster, both --cohesity-cluster and --cohesity-job must be given
-explicitly, or backup registration is skipped with a warning (volume is still created).
-
-For NFS volumes:
-          --export-policy <policy_name> (optional, defaults to volume name)
-          --client-match <client_pattern>
-          --comment <description>
-
-For CIFS volumes:
-          --junction-path <path> --comment <description>
+For any other --cluster, both --cohesity-cluster and --cohesity-job must be
+given explicitly, or backup registration is skipped with a warning.
 
 Examples:
-  NFS: %(prog)s --type nfs --user admin --cluster cluster1 --svm svm1 --volume vol1
-           --size 100 --aggregate aggr1 --snap-policy CTIE_default
-           --export-policy expol1 --client-match 10.0.0.0/24
-           --comment 'Test volume'
+  netapp aggregate list --user admin --cluster cluster1
 
-  CIFS: %(prog)s --type cifs --user admin --cluster cluster1 --svm svm1 --volume vol1
-           --size 100 --aggregate aggr1 --snap-policy CTIE_default
-           --backup-svm backup_svm --junction-path /share1 --comment 'Test volume'
+  netapp volume create --type nfs --user admin --cluster cluster1 --svm svm1 \\
+      --volume vol1 --size 100 --aggregate aggr1 --snap-policy CTIE_default \\
+      --client-match 10.0.0.0/24 --comment 'Test volume'
+
+  netapp volume create --type cifs --user admin --cluster cluster1 --svm svm1 \\
+      --volume vol1 --size 100 --aggregate aggr1 --snap-policy CTIE_default \\
+      --junction-path /share1 --comment 'Test volume'
+
+  netapp volume delete --user admin --cluster cluster1 --svm svm1 --volume vol1
+
+  netapp volume check --user admin --cluster cluster1 --svm svm1 --volume vol1
 """
 
 
@@ -1436,52 +1428,125 @@ def check_volume_status(args):
         print(f"  NOT currently protected by any active Cohesity job on {cohesity_cluster}.")
 
 
+def _common_ontap_parser():
+    """ONTAP connection/auth/dry-run/confirmation flags, shared by every
+    subcommand that talks to ONTAP and/or Cohesity."""
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--user")
+    p.add_argument("--cluster")
+    p.add_argument("--api", dest="api_mode", default="ssh")
+    p.add_argument("--cert-file", dest="ontap_cert_file")
+    p.add_argument("--key-file", dest="ontap_key_file")
+    p.add_argument("--password", dest="ontap_password")
+    p.add_argument("--ca-bundle", dest="ontap_ca_bundle")
+    p.add_argument("--insecure-ontap", dest="ontap_insecure", action="store_true")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true")
+    p.add_argument("--yes", dest="assume_yes", action="store_true")
+    return p
+
+
+def _cohesity_parser():
+    """Cohesity backup-registration flags, shared by 'volume create',
+    'volume check', and 'volume backup'."""
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--backup-tier", dest="backup_tier")
+    p.add_argument("--cohesity-apikey", dest="cohesity_apikey")
+    p.add_argument("--cohesity-cluster", dest="cohesity_cluster_override")
+    p.add_argument("--cohesity-job", dest="cohesity_job_override")
+    return p
+
+
 def build_parser():
+    common = _common_ontap_parser()
+    cohesity = _cohesity_parser()
+
     parser = argparse.ArgumentParser(
-        prog="netapp_volume_create.py",
+        prog="netapp",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=EPILOG,
-        add_help=False,
+        description=TOP_DESCRIPTION,
+        epilog=TOP_EPILOG,
     )
-    parser.add_argument("--type", dest="volume_type")
-    parser.add_argument("--user")
-    parser.add_argument("--cluster")
-    parser.add_argument("--svm", dest="svm_name")
-    parser.add_argument("--volume", dest="volume_name")
-    parser.add_argument("--size", dest="vol_size")
-    parser.add_argument("--aggregate")
-    parser.add_argument("--snap-policy", dest="snap_policy")
-    parser.add_argument("--tiering-policy", dest="tiering_policy")
-    parser.add_argument("--export-policy", dest="export_policy")
-    parser.add_argument("--client-match", dest="client_match")
-    parser.add_argument("--junction-path", dest="junction_path")
-    parser.add_argument("--comment")
-    parser.add_argument("--backup-tier", dest="backup_tier")
-    parser.add_argument("--cohesity-apikey", dest="cohesity_apikey")
-    parser.add_argument("--cohesity-cluster", dest="cohesity_cluster_override")
-    parser.add_argument("--cohesity-job", dest="cohesity_job_override")
-    parser.add_argument("--no-backup", dest="no_backup", action="store_true")
-    parser.add_argument("--backup-only", dest="backup_only", action="store_true")
-    parser.add_argument("--check", dest="check_mode", action="store_true")
-    parser.add_argument("--list-aggregates", dest="list_aggregates_only", action="store_true")
-    parser.add_argument("--delete", dest="delete_mode", action="store_true")
-    parser.add_argument("--yes", dest="assume_yes", action="store_true")
-    parser.add_argument("--dry-run", dest="dry_run", action="store_true")
-    parser.add_argument("--api", dest="api_mode", default="ssh")
-    parser.add_argument("--cert-file", dest="ontap_cert_file")
-    parser.add_argument("--key-file", dest="ontap_key_file")
-    parser.add_argument("--password", dest="ontap_password")
-    parser.add_argument("--ca-bundle", dest="ontap_ca_bundle")
-    parser.add_argument("--insecure-ontap", dest="ontap_insecure", action="store_true")
-    parser.add_argument("-h", "--help", action="store_true", dest="show_help")
-    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--version", action="version", version=f"netapp version {SCRIPT_VERSION}")
+
+    resources = parser.add_subparsers(dest="resource", required=True, metavar="<resource>")
+
+    volume = resources.add_parser("volume", help="Manage NetApp volumes")
+    volume_actions = volume.add_subparsers(dest="action", required=True, metavar="<action>")
+
+    create = volume_actions.add_parser(
+        "create", parents=[common, cohesity], help="Create an NFS or CIFS volume",
+        description="Create an NFS or CIFS volume, then register it with Cohesity unless --no-backup.",
+    )
+    create.add_argument("--type", dest="volume_type")
+    create.add_argument("--svm", dest="svm_name")
+    create.add_argument("--volume", dest="volume_name")
+    create.add_argument("--size", dest="vol_size")
+    create.add_argument("--aggregate")
+    create.add_argument("--snap-policy", dest="snap_policy")
+    create.add_argument("--tiering-policy", dest="tiering_policy")
+    create.add_argument("--export-policy", dest="export_policy")
+    create.add_argument("--client-match", dest="client_match")
+    create.add_argument("--junction-path", dest="junction_path")
+    create.add_argument("--comment")
+    create.add_argument("--no-backup", dest="no_backup", action="store_true")
+
+    delete = volume_actions.add_parser(
+        "delete", parents=[common], help="Delete a volume (and its export-policy, if safe)",
+        description="Delete a volume (unmounting first if needed) and, if safe (no other "
+                     "volume on the vserver still uses it), its export-policy too. Asks for "
+                     "confirmation (type DELETE) unless --yes.",
+    )
+    delete.add_argument("--svm", dest="svm_name")
+    delete.add_argument("--volume", dest="volume_name")
+
+    check = volume_actions.add_parser(
+        "check", parents=[common, cohesity], help="Read-only ONTAP + Cohesity status report",
+        description="Read-only status report: ONTAP state/mount/export-policy rules, "
+                     "Cohesity discovery and protection job(s), and client access info. "
+                     "Makes NO changes anywhere - safe to run any time.",
+    )
+    check.add_argument("--svm", dest="svm_name")
+    check.add_argument("--volume", dest="volume_name")
+    check.add_argument("--type", dest="volume_type")
+
+    backup = volume_actions.add_parser(
+        "backup", parents=[common, cohesity], help="Register an already-existing volume with Cohesity",
+        description="Registers an ALREADY-EXISTING volume with Cohesity - no ONTAP call is "
+                     "made, --user is not required. Use this to retry Cohesity registration "
+                     "after 'volume create' succeeded but its backup step failed.",
+    )
+    backup.add_argument("--svm", dest="svm_name")
+    backup.add_argument("--volume", dest="volume_name")
+
+    aggregate = resources.add_parser("aggregate", help="Query NetApp aggregates")
+    aggregate_actions = aggregate.add_subparsers(dest="action", required=True, metavar="<action>")
+    aggregate_actions.add_parser(
+        "list", parents=[common], help="List aggregate occupancy",
+        description="Prints aggregate occupancy (size, available, used, state, #vols) for --cluster.",
+    )
+
     return parser
+
+
+# Maps an internal dest name back to the flag a user would actually type,
+# for require_args()'s error messages - dest and flag diverge for several
+# (e.g. dest "svm_name" is flag "--svm", not "--svm-name").
+ARG_FLAG_NAMES = {
+    "user": "--user",
+    "cluster": "--cluster",
+    "svm_name": "--svm",
+    "volume_name": "--volume",
+    "volume_type": "--type",
+    "vol_size": "--size",
+    "snap_policy": "--snap-policy",
+}
 
 
 def require_args(args, names):
     for name in names:
         if not getattr(args, name, None):
-            error_exit(f"Missing required argument: --{name.replace('_', '-')}")
+            flag = ARG_FLAG_NAMES.get(name, "--" + name.replace("_", "-"))
+            error_exit(f"Missing required argument: {flag}")
 
 
 def main(argv=None):
@@ -1493,19 +1558,21 @@ def main(argv=None):
     if unknown:
         error_exit(f"Unknown option: {unknown[0]}")
 
-    if args.show_help:
-        parser.print_help()
-        sys.exit(0)
+    # Map the "netapp <resource> <action>" the user picked onto the same
+    # internal mode flags the rest of this file's logic keys off of. The
+    # one case that sets none of these - "volume create" - falls through to
+    # the create flow at the bottom, same as before this was a subcommand CLI.
+    list_aggregates_only = args.resource == "aggregate" and args.action == "list"
+    delete_mode = args.resource == "volume" and args.action == "delete"
+    backup_only = args.resource == "volume" and args.action == "backup"
+    check_mode = args.resource == "volume" and args.action == "check"
 
-    if args.version:
-        print(f"netapp_volume_create.py version {SCRIPT_VERSION}")
-        sys.exit(0)
-
-    # Defaults for optional parameters
-    if not args.comment:
+    # Defaults for optional parameters - only meaningful for "volume
+    # create", the only subcommand where these flags exist at all.
+    if not getattr(args, "comment", None):
         args.comment = "Created by netapp_volume script"
-    if not args.export_policy:
-        args.export_policy = args.volume_name
+    if not getattr(args, "export_policy", None):
+        args.export_policy = getattr(args, "volume_name", None)
 
     if args.api_mode not in ("ssh", "rest"):
         error_exit(f"--api must be ssh or rest (got '{args.api_mode}')")
@@ -1513,14 +1580,14 @@ def main(argv=None):
     if args.dry_run:
         print("[INFO] --dry-run: no ONTAP or Cohesity changes will be made. Commands that would run are printed with a [DRY-RUN] prefix.")
 
-    # --list-aggregates: just show occupancy and exit, no volume created
-    if args.list_aggregates_only:
+    # aggregate list: just show occupancy and exit, no volume created
+    if list_aggregates_only:
         require_args(args, ["user", "cluster"])
         print(list_aggregates(args), end="")
         sys.exit(0)
 
-    # --delete: remove a volume (and its export-policy, if safe) and exit
-    if args.delete_mode:
+    # volume delete: remove a volume (and its export-policy, if safe) and exit
+    if delete_mode:
         require_args(args, ["user", "cluster", "svm_name", "volume_name"])
         if args.api_mode == "rest":
             delete_volume_rest(args)
@@ -1528,30 +1595,28 @@ def main(argv=None):
             delete_volume(args)
         sys.exit(0)
 
-    # --backup-only: register an ALREADY-EXISTING volume with Cohesity and
+    # volume backup: register an ALREADY-EXISTING volume with Cohesity and
     # exit - no ONTAP call is made at all (--api is irrelevant here). This
     # is the recovery path if volume creation succeeded but the Cohesity
     # step failed/was skipped (bad --cohesity-apikey, job not found yet,
-    # etc.) - re-running the full create command in that situation just
-    # fails on "export-policy already exists". --user is intentionally not
-    # required here since nothing touches ONTAP in this mode.
-    if args.backup_only:
+    # etc.) - re-running 'volume create' in that situation just fails on
+    # "export-policy already exists". --user is intentionally not required
+    # here since nothing touches ONTAP in this mode.
+    if backup_only:
         require_args(args, ["cluster", "svm_name", "volume_name"])
-        if args.no_backup:
-            error_exit("--backup-only and --no-backup are mutually exclusive")
         protect_volume_in_cohesity(args)
         sys.exit(0)
 
-    # --check: read-only status report (ONTAP + Cohesity), no changes made
-    if args.check_mode:
+    # volume check: read-only status report (ONTAP + Cohesity), no changes made
+    if check_mode:
         require_args(args, ["user", "cluster", "svm_name", "volume_name"])
         if args.api_mode == "rest":
-            error_exit("--api rest is not yet implemented for --check; use --api ssh (the default) for --check.")
+            error_exit("--api rest is not yet implemented for 'volume check'; use --api ssh (the default).")
         check_volume_status(args)
         sys.exit(0)
 
-    # Validate required arguments (aggregate is NOT required here - if
-    # missing, we prompt interactively below instead of failing)
+    # volume create: validate required arguments (aggregate is NOT required
+    # here - if missing, we prompt interactively below instead of failing)
     require_args(args, ["volume_type", "user", "cluster", "svm_name", "volume_name", "vol_size", "snap_policy"])
 
     # Parse --size into size_num / size_unit (accepts "100" or "100GB")
