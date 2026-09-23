@@ -2,7 +2,7 @@
 
 import sys
 
-from .constants import DOMAIN
+from .config import settings
 
 # requests is only needed for --api rest and Cohesity; the default ssh path
 # works without it, so a missing install is reported where it matters
@@ -31,7 +31,7 @@ def silence_insecure_request_warnings():
 
 
 def remote_host(cluster):
-    return f"{cluster}.{DOMAIN}"
+    return f"{cluster}.{settings().domain}"
 
 
 def format_bytes_human(n):

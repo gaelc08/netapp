@@ -1,7 +1,7 @@
 """Client access info block printed after a create / on 'volume check'."""
 
 from . import ontap_rest, ontap_ssh
-from .constants import COHESITY_BACKUP_NETWORK_PREFIX
+from .config import settings
 from .util import remote_host
 
 
@@ -23,7 +23,7 @@ def print_client_access_info(args, protocol, mount_path, policy_for_lookup=None)
     print("============================================")
 
     all_lifs = get_svm_lifs(args)
-    lifs = [ip for ip in all_lifs if not ip.startswith(COHESITY_BACKUP_NETWORK_PREFIX)]
+    lifs = [ip for ip in all_lifs if not ip.startswith(settings().cohesity_backup_network_prefix)]
     lifs_str = " ".join(lifs)
 
     if not all_lifs:

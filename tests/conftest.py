@@ -10,7 +10,7 @@ import time
 import pytest
 import requests
 
-from netapp import rollback
+from netapp import config, rollback
 
 
 class FakeCompleted:
@@ -67,6 +67,18 @@ class Fakes:
         return [c for c in self.calls if c[0] == "http"]
 
 
+@pytest.fixture(autouse=True)
+def isolated_config(monkeypatch, tmp_path):
+    """Never pick up the developer's own config / .env: run from an empty
+    directory with the user-level search paths pointed nowhere, so every
+    test uses the bundled default_config.yaml unless it says otherwise."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "CONFIG_SEARCH_PATH", [tmp_path / "no-such-config.yaml"])
+    monkeypatch.setattr(config, "USER_ENV_FILE", tmp_path / "no-such.env")
+    monkeypatch.delenv("NETAPP_CONFIG", raising=False)
+    monkeypatch.setattr(config, "_current", None)
+
+
 @pytest.fixture
 def fakes(monkeypatch):
     f = Fakes()
@@ -75,7 +87,8 @@ def fakes(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda s: None)
     monkeypatch.setattr("builtins.input", lambda prompt="": f.inputs.pop(0) if f.inputs else "")
     monkeypatch.setattr(getpass, "getpass", lambda prompt="": "")
-    for var in ("COHESITY_APIKEY", "COHESITY_CA_BUNDLE", "ONTAP_PASSWORD", "ONTAP_CERT_FILE", "ONTAP_KEY_FILE"):
+    for var in ("COHESITY_APIKEY", "COHESITY_CA_BUNDLE", "ONTAP_PASSWORD", "ONTAP_CERT_FILE", "ONTAP_KEY_FILE",
+                "ONTAP_CA_BUNDLE"):
         monkeypatch.delenv(var, raising=False)
     rollback.clear()
     yield f

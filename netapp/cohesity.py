@@ -13,7 +13,8 @@ import os
 import sys
 import time
 
-from .constants import BACKUP_TIERS, COHESITY_CLUSTER_MAP
+from .config import settings
+from .constants import BACKUP_TIERS
 from .util import HAVE_REQUESTS, error_exit, requests
 
 
@@ -143,7 +144,7 @@ def _error_message(response):
 
 def map_cohesity_cluster(cluster):
     """Returns (cohesity_cluster, suffix) or None if unmapped."""
-    return COHESITY_CLUSTER_MAP.get(cluster)
+    return settings().cohesity_clusters.get(cluster)
 
 
 def resolve_cohesity_cluster(args):
@@ -235,7 +236,7 @@ def protect_volume(args):
     if mapped:
         cohesity_cluster, cohesity_suffix = mapped
     elif not getattr(args, "cohesity_cluster_override", None) or not getattr(args, "cohesity_job_override", None):
-        print(f"[WARN] No known Cohesity mapping for NetApp cluster '{args.cluster}' (known: {', '.join(sorted(COHESITY_CLUSTER_MAP))}).", file=sys.stderr)
+        print(f"[WARN] No known Cohesity mapping for NetApp cluster '{args.cluster}' (known: {', '.join(sorted(settings().cohesity_clusters))}).", file=sys.stderr)
         print("[WARN] Pass both --cohesity-cluster and --cohesity-job to protect this volume, or add it manually later. Skipping.", file=sys.stderr)
         return
     if getattr(args, "cohesity_cluster_override", None):

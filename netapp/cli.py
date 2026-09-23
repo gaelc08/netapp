@@ -3,7 +3,7 @@
 import argparse
 import sys
 
-from . import __version__, cohesity, rollback, volume
+from . import __version__, cohesity, config, rollback, volume
 from .aggregate import list_aggregates, select_aggregate_interactively
 from .util import error_exit, silence_insecure_request_warnings
 from .validation import parse_size, validate_inputs
@@ -63,7 +63,8 @@ ONTAP REST authentication (only relevant with --api rest), tried in order:
      (security login create -authmethod cert).
   2. HTTP basic auth otherwise, using --user plus [--password <password>]
      (falls back to $ONTAP_PASSWORD, then a hidden prompt).
-  [--ca-bundle <path>]     trust a private/internal CA (default: normal TLS verification)
+  [--ca-bundle <path>]     trust a private/internal CA (falls back to $ONTAP_CA_BUNDLE;
+                           default: normal TLS verification)
   [--insecure-ontap]       skip TLS verification entirely - not recommended
 
 Cohesity backup (volume create/check/backup):
@@ -82,6 +83,16 @@ The Cohesity cluster and job name are derived from --cluster and --backup-tier:
   damascus-4, jericho-2 -> closluce-2, job '<Cluster>-<Tier>Term-CS3'
 For any other --cluster, both --cohesity-cluster and --cohesity-job must be
 given explicitly, or backup registration is skipped with a warning.
+
+Configuration and secrets (every command):
+  [--config <path>]    site config (snapshot policies, Cohesity cluster/job
+                       mapping, DNS domain). Default: $NETAPP_CONFIG, else
+                       ~/.config/netapp/config.yaml, else /etc/netapp/config.yaml,
+                       else the copy bundled with netapp (default_config.yaml).
+  [--env-file <path>]  secrets loaded into the environment before anything
+                       else (e.g. COHESITY_APIKEY, ONTAP_PASSWORD,
+                       COHESITY_CA_BUNDLE). Default: ./.env if present, else
+                       ~/.config/netapp/.env if present. See .env.example.
 
 Examples:
   netapp aggregate list --user admin --cluster cluster1
@@ -114,6 +125,8 @@ def _common_ontap_parser():
     p.add_argument("--insecure-ontap", dest="ontap_insecure", action="store_true")
     p.add_argument("--dry-run", dest="dry_run", action="store_true")
     p.add_argument("--yes", dest="assume_yes", action="store_true")
+    p.add_argument("--config", dest="config_file")
+    p.add_argument("--env-file", dest="env_file")
     return p
 
 
@@ -233,6 +246,14 @@ def main(argv=None):
     if unknown:
         error_exit(f"Unknown option: {unknown[0]}")
     rollback.clear()
+
+    # Secrets first (so ${VAR} placeholders in the config can use them),
+    # then the site config itself.
+    try:
+        config.load_env_file(args.env_file)
+        config.load(args.config_file)
+    except config.ConfigError as exc:
+        error_exit(str(exc))
 
     # Defaults for optional parameters - only meaningful for "volume
     # create", the only subcommand where these flags exist at all.

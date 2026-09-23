@@ -9,7 +9,8 @@ package once that script passed ~1800 lines.
 
 Module layout:
     cli.py          argument parsing and subcommand dispatch
-    constants.py    site-specific values (snapshot policies, Cohesity mapping, ...)
+    config.py       config.yaml + .env loading
+    constants.py    fixed values (size units, backup tiers)
     util.py         error_exit, remote_host, byte formatting, optional requests import
     validation.py   --size parsing/padding and volume create input checks
     rollback.py     single undo stack shared by the ssh and REST paths

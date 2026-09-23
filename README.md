@@ -24,12 +24,38 @@ pip install -r requirements.txt
 ./bin/netapp -h          # or: python3 -m netapp -h
 ```
 
+## Configuration and secrets
+
+Site-specific values - the valid `--snap-policy` names and their protocol
+restrictions, the NetApp -> Cohesity cluster/job mapping, the Cohesity
+backup LIF network, and the DNS domain clusters are reached under - live
+in a YAML file, not in the code. The copy bundled with the package
+(`netapp/default_config.yaml`) holds the current values, so nothing needs
+configuring to get started. To change them, copy that file and edit it;
+the first of these that exists is used, and replaces the bundled one
+entirely:
+
+1. `--config <path>`
+2. `$NETAPP_CONFIG`
+3. `~/.config/netapp/config.yaml`
+4. `/etc/netapp/config.yaml`
+
+As in cos2pag, any `${VAR_NAME}` in the YAML is read from the environment.
+
+Secrets go in a `.env` file instead (see `.env.example`): `./.env` if
+present, else `~/.config/netapp/.env`, or `--env-file <path>`. It can hold
+`COHESITY_APIKEY`, `COHESITY_CA_BUNDLE`, `ONTAP_PASSWORD`,
+`ONTAP_CERT_FILE`/`ONTAP_KEY_FILE` and `ONTAP_CA_BUNDLE`. A command-line
+flag always wins over the environment.
+
 ## Layout
 
 ```
 netapp/
   cli.py          argument parsing and subcommand dispatch
-  constants.py    site-specific values (snapshot policies, Cohesity mapping, ...)
+  config.py       config.yaml + .env loading
+  default_config.yaml  bundled site config (see above)
+  constants.py    fixed values (size units, backup tiers)
   validation.py   --size parsing/padding and 'volume create' input checks
   rollback.py     single undo stack shared by the ssh and REST paths
   ontap_ssh.py    ONTAP over ssh (default --api)
@@ -43,7 +69,7 @@ tests/            pytest suite (ssh, HTTP and prompts are all faked)
 bin/netapp        launcher for running from a checkout
 ```
 
-Run the tests with `pip install -e '.[dev]' && pytest`.
+Run the checks CI runs with `pip install -e '.[dev]' && ruff check . && pytest`.
 
 ## Commands
 
@@ -100,8 +126,8 @@ to print what would happen without making any ONTAP or Cohesity call.
 
   TLS is verified by default. Most intranet clusters present a
   self-signed/internal-CA cert, so you'll likely need either
-  `--ca-bundle <path-to-your-CA>` or, for quick testing only,
-  `--insecure-ontap`.
+  `--ca-bundle <path-to-your-CA>` (or `ONTAP_CA_BUNDLE` in your `.env`)
+  or, for quick testing only, `--insecure-ontap`.
 
 ## Cohesity backup
 
@@ -113,7 +139,7 @@ prompt.
 TLS to the Cohesity API is verified by default, same as ONTAP REST. If the
 Cohesity clusters present an internal-CA certificate, point at that CA with
 `--cohesity-ca-bundle <path>` or, more conveniently, `export
-COHESITY_CA_BUNDLE=<path>` once in your shell profile. `--insecure-cohesity`
+COHESITY_CA_BUNDLE=<path>` (shell profile or `.env`). `--insecure-cohesity`
 skips verification entirely (not recommended; the API key is sent with
 every request). A verification failure is reported explicitly rather than
 as a generic "could not fetch" warning.

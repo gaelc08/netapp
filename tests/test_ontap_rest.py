@@ -38,15 +38,29 @@ def test_failed_job_rolls_back_export_policy(fakes, capsys):
     assert "job exploded" in capsys.readouterr().err
 
 
-def test_ca_bundle_and_insecure_flags(fakes):
+AGGREGATES = ["aggregate", "list", "--user", "a", "--cluster", "c", "--api", "rest", "--password", "p"]
+
+
+def test_ca_bundle_and_insecure_flags(fakes, tmp_path, monkeypatch):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("x")
     fakes.on_http("GET", "/api/storage/aggregates", 200, {"records": []})
     with pytest.raises(SystemExit):
-        main(["aggregate", "list", "--user", "a", "--cluster", "c", "--api", "rest", "--password", "p",
-              "--ca-bundle", "/etc/ca.pem"])
+        main(AGGREGATES + ["--ca-bundle", str(ca)])
     with pytest.raises(SystemExit):
-        main(["aggregate", "list", "--user", "a", "--cluster", "c", "--api", "rest", "--password", "p",
-              "--insecure-ontap"])
-    assert [c[3]["verify"] for c in fakes.http_calls()] == ["/etc/ca.pem", False]
+        main(AGGREGATES + ["--insecure-ontap"])
+    monkeypatch.setenv("ONTAP_CA_BUNDLE", str(ca))
+    with pytest.raises(SystemExit):
+        main(AGGREGATES)
+    assert [c[3]["verify"] for c in fakes.http_calls()] == [str(ca), False, str(ca)]
+
+
+def test_missing_ca_bundle_is_a_clean_error_not_a_traceback(fakes, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(AGGREGATES + ["--ca-bundle", "/nope/ca.pem"])
+    assert exc.value.code == 1
+    assert "ONTAP CA bundle '/nope/ca.pem' does not exist" in capsys.readouterr().err
+    assert fakes.http_calls() == []
 
 
 def test_cert_file_and_key_file_must_come_together(fakes, capsys):

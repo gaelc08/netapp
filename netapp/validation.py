@@ -2,7 +2,8 @@
 
 import re
 
-from .constants import SNAP_POLICY_PROTOCOL_RESTRICTIONS, VALID_SIZE_UNITS, VALID_SNAP_POLICIES
+from .config import settings
+from .constants import VALID_SIZE_UNITS
 from .util import error_exit
 
 SIZE_WITH_UNIT_RE = re.compile(r"^([0-9]+(\.[0-9]+)?)([A-Za-z]+)$")
@@ -48,10 +49,11 @@ def nfs_size_and_snapshot_reserve(snap_policy, size_num, size_unit):
 
 
 def validate_inputs(args):
-    if args.snap_policy not in VALID_SNAP_POLICIES:
-        error_exit(f"snap_policy must be one of: {' '.join(VALID_SNAP_POLICIES)}")
+    valid_policies = settings().snap_policies
+    if args.snap_policy not in valid_policies:
+        error_exit(f"snap_policy must be one of: {' '.join(valid_policies)}")
 
-    restricted_to = SNAP_POLICY_PROTOCOL_RESTRICTIONS.get(args.snap_policy)
+    restricted_to = settings().snap_policy_protocols.get(args.snap_policy)
     if restricted_to and args.volume_type != restricted_to:
         error_exit(f"--snap-policy {args.snap_policy} is only valid for --type {restricted_to} volumes (got --type {args.volume_type})")
 

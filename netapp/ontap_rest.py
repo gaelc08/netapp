@@ -60,11 +60,23 @@ def resolve_ontap_auth(args):
     return {"auth": (args.user, password)}
 
 
+def ontap_tls_verify(args):
+    """requests' `verify` for ONTAP REST: verified by default (against the
+    system CA store, or --ca-bundle / $ONTAP_CA_BUNDLE), False only with an
+    explicit --insecure-ontap. A CA bundle path that doesn't exist is
+    rejected here with a clear message - requests would otherwise raise a
+    bare OSError (not a RequestException) and crash with a traceback."""
+    if getattr(args, "ontap_insecure", False):
+        return False
+    ca_bundle = getattr(args, "ontap_ca_bundle", None) or os.environ.get("ONTAP_CA_BUNDLE")
+    if ca_bundle and not os.path.isfile(ca_bundle):
+        error_exit(f"ONTAP CA bundle '{ca_bundle}' does not exist")
+    return ca_bundle or True
+
+
 def ontap_rest_request(args, method, path, **kwargs):
     """Issues one raw ONTAP REST call against --cluster and returns the
-    requests.Response. TLS is verified by default; pass --ca-bundle for an
-    internal/self-signed CA, or --insecure-ontap to skip verification (not
-    recommended). Raises requests.RequestException on a connection-level
+    requests.Response. TLS verification: see ontap_tls_verify(). Raises requests.RequestException on a connection-level
     failure (DNS/connect/timeout/TLS) - callers use ontap_rest_json(), which
     catches that the same way ssh_capture() lets a failed ssh command return
     a non-zero exit code instead of crashing the script."""
@@ -72,10 +84,7 @@ def ontap_rest_request(args, method, path, **kwargs):
         error_exit("Python 'requests' package not found - required for --api rest (pip install requests)")
 
     auth_kwargs = resolve_ontap_auth(args)
-    if getattr(args, "ontap_insecure", False):
-        verify = False
-    else:
-        verify = getattr(args, "ontap_ca_bundle", None) or True
+    verify = ontap_tls_verify(args)
 
     url = f"https://{remote_host(args.cluster)}/api{path}"
     return requests.request(method, url, timeout=30, verify=verify, headers={"Accept": "application/json"}, **auth_kwargs, **kwargs)
