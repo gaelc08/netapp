@@ -6,7 +6,7 @@ optional Cohesity backup registration. Originally a straight Python port of
 netapp_volume_create.sh; restructured from single-purpose flags (--delete,
 --check, --backup-only, --list-aggregates) into subcommands once it grew
 past "just create volumes".
-Version: 2026-09-23-09 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
+Version: 2026-09-23-10 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
 """
 
 import argparse
@@ -26,7 +26,7 @@ try:
 except ImportError:
     HAVE_REQUESTS = False
 
-SCRIPT_VERSION = "2026-09-23-09"
+SCRIPT_VERSION = "2026-09-23-10"
 
 # LIF addresses on this network are reserved for Cohesity backup traffic
 # and must never be handed out to clients as a mount target - excluded
@@ -1338,6 +1338,94 @@ def protect_volume_in_cohesity(args):
         print("[WARN] The volume itself was created successfully. Protect it manually.", file=sys.stderr)
 
 
+def unprotect_volume_in_cohesity(args):
+    """Removes a just-deleted volume's sourceId from any Cohesity
+    protection job(s) that reference it, cleaning up the stale reference
+    'volume delete' would otherwise leave behind. Does NOT delete any
+    backup snapshot data already taken for that volume - that stays until
+    Cohesity's own retention policy expires it, or someone removes it
+    explicitly via Cohesity; deleting real backup data is not something
+    this should ever do silently as a side effect of an ONTAP delete.
+    Never fatal - the ONTAP volume is already gone by the time this runs.
+
+    Caveat: this only finds the volume if Cohesity's own discovery tree
+    still lists it as a source. If Cohesity's periodic scan has already
+    run and dropped it since the ONTAP delete (a race, and an unlikely one
+    given scan intervals are normally minutes), a stale sourceId can be
+    left in the job - same "discovery can lag" caveat documented for
+    'volume check'."""
+    print("")
+
+    if getattr(args, "dry_run", False):
+        print(f"[DRY-RUN] Would check Cohesity for protection job(s) referencing deleted volume '{args.volume_name}' and remove it from any that are found (no API calls made, no API key needed).")
+        return
+
+    print(f"[INFO] Checking Cohesity protection for deleted volume '{args.volume_name}'...")
+
+    if not HAVE_REQUESTS:
+        print("[WARN] Python 'requests' package not found - skipping Cohesity cleanup.", file=sys.stderr)
+        return
+
+    cohesity_cluster = None
+    mapped = map_cohesity_cluster(args.cluster)
+    if mapped:
+        cohesity_cluster = mapped[0]
+    if not mapped and not getattr(args, "cohesity_cluster_override", None):
+        print(f"[WARN] No known Cohesity mapping for cluster '{args.cluster}' - pass --cohesity-cluster to clean up manually. Skipping.", file=sys.stderr)
+        return
+    if getattr(args, "cohesity_cluster_override", None):
+        cohesity_cluster = args.cohesity_cluster_override
+
+    apikey = get_cohesity_apikey(args, cohesity_cluster)
+
+    source_id = find_cohesity_source_id(cohesity_cluster, apikey, args.cluster, args.svm_name, args.volume_name)
+    if source_id is None:
+        print(f"[INFO] '{args.volume_name}' was not found in Cohesity's source tree - nothing to unregister (or its discovery scan already dropped it).")
+        return
+
+    jobs_raw = cohesity_json("GET", f"https://{cohesity_cluster}/irisservices/api/v1/public/protectionJobs?isDeleted=false&isActive=true", apikey)
+    if not isinstance(jobs_raw, list):
+        print(f"[WARN] Could not fetch protection jobs from {cohesity_cluster} to check protection status.", file=sys.stderr)
+        return
+
+    job_ids = [j["id"] for j in jobs_raw if j.get("environment") == "kNetapp"]
+    removed_from = []
+    for jid in job_ids:
+        detail = cohesity_json("GET", f"https://{cohesity_cluster}/irisservices/api/v1/public/protectionJobs/{jid}", apikey)
+        if not isinstance(detail, dict):
+            continue
+        job_name = detail.get("name")
+        source_ids = detail.get("sourceIds") or []
+        if source_id not in source_ids:
+            continue
+
+        if not args.assume_yes:
+            confirm = input(f"Remove deleted volume '{args.volume_name}' from Cohesity job '{job_name}' on {cohesity_cluster}? [y/N] ")
+            if confirm not in ("y", "Y"):
+                print(f"[INFO] Left '{args.volume_name}' registered in '{job_name}' (not confirmed).")
+                continue
+
+        updated_job = dict(detail)
+        updated_job["sourceIds"] = [sid for sid in source_ids if sid != source_id]
+        special_params = detail.get("sourceSpecialParameters")
+        if special_params:
+            updated_job["sourceSpecialParameters"] = [p for p in special_params if p.get("sourceId") != source_id]
+
+        response = cohesity_json("PUT", f"https://{cohesity_cluster}/irisservices/api/v1/public/protectionJobs/{jid}", apikey,
+                                  headers={"Content-Type": "application/json"}, data=json.dumps(updated_job))
+        if isinstance(response, dict) and response.get("id"):
+            print(f"[INFO] Removed '{args.volume_name}' from Cohesity protection job '{job_name}'.")
+            removed_from.append(job_name)
+        else:
+            err = "unknown error"
+            if isinstance(response, dict):
+                err = response.get("message") or response.get("errorCode") or "unknown error"
+            print(f"[WARN] Failed to remove '{args.volume_name}' from Cohesity job '{job_name}' - {err}", file=sys.stderr)
+
+    if not removed_from:
+        print(f"[INFO] '{args.volume_name}' was not registered in any active Cohesity job on {cohesity_cluster}.")
+
+
 # ── Read-only status check ──────────────────────────────────────────────────
 def check_volume_status(args):
     """Reports ONTAP volume state/mount and Cohesity discovery/protection
@@ -1504,13 +1592,17 @@ def build_parser():
     create.add_argument("--no-backup", dest="no_backup", action="store_true")
 
     delete = volume_actions.add_parser(
-        "delete", parents=[common], help="Delete a volume (and its export-policy, if safe)",
+        "delete", parents=[common, cohesity], help="Delete a volume (and its export-policy, if safe)",
         description="Delete a volume (unmounting first if needed) and, if safe (no other "
                      "volume on the vserver still uses it), its export-policy too. Asks for "
-                     "confirmation (type DELETE) unless --yes.",
+                     "confirmation (type DELETE) unless --yes. Afterward, also removes the "
+                     "volume from any Cohesity protection job it was in (unless --no-unprotect) "
+                     "- this does NOT delete any backup data already taken, only the stale "
+                     "registration.",
     )
     delete.add_argument("--svm", dest="svm_name")
     delete.add_argument("--volume", dest="volume_name")
+    delete.add_argument("--no-unprotect", dest="no_unprotect", action="store_true")
 
     check = volume_actions.add_parser(
         "check", parents=[common, cohesity], help="Read-only ONTAP + Cohesity status report",
@@ -1606,6 +1698,8 @@ def main(argv=None):
             delete_volume_rest(args)
         else:
             delete_volume(args)
+        if not args.no_unprotect:
+            unprotect_volume_in_cohesity(args)
         sys.exit(0)
 
     # volume backup: register an ALREADY-EXISTING volume with Cohesity and

@@ -90,6 +90,12 @@ The Cohesity cluster and job name are derived from `--cluster` and
 For any other cluster, pass both `--cohesity-cluster` and `--cohesity-job`
 explicitly, or backup registration is skipped with a warning.
 
+`volume delete` automatically removes the deleted volume from any Cohesity
+job it was registered in afterward (`--no-unprotect` to skip). This only
+unregisters the stale reference - it does **not** delete any backup
+snapshot data already taken; that stays until Cohesity's own retention
+policy expires it, or someone removes it explicitly via Cohesity.
+
 ## Snapshot policies
 
 Valid values for `--snap-policy`: `CTIE_daily`, `CTIE_daily_315`,
