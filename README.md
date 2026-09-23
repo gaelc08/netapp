@@ -3,16 +3,47 @@
 A NetApp ONTAP volume management CLI, with optional Cohesity backup
 registration. Python port of `netapp_volume_create.sh`, restructured into
 `netapp <resource> <action>` subcommands once it grew past "just create
-volumes".
+volumes", then split from a single script into a package.
 
 ## Requirements
 
-- Python 3
-- `pip install -r requirements.txt` (just `requests`, used for the ONTAP
-  REST API mode and all Cohesity calls)
+- Python 3.8+
+- `requests` (used for the ONTAP REST API mode and all Cohesity calls)
 - For the default `--api ssh` mode: passwordless SSH key access to the
   target cluster (`<cluster>.ctie.etat.lu`), the same as the original bash
   script required.
+
+## Installing / running
+
+```bash
+pip install .            # installs a `netapp` command on PATH
+netapp -h
+
+# or straight from a checkout, without installing:
+pip install -r requirements.txt
+./bin/netapp -h          # or: python3 -m netapp -h
+```
+
+## Layout
+
+```
+netapp/
+  cli.py          argument parsing and subcommand dispatch
+  constants.py    site-specific values (snapshot policies, Cohesity mapping, ...)
+  validation.py   --size parsing/padding and 'volume create' input checks
+  rollback.py     single undo stack shared by the ssh and REST paths
+  ontap_ssh.py    ONTAP over ssh (default --api)
+  ontap_rest.py   ONTAP over its REST API (--api rest)
+  volume.py       volume create/delete/check orchestration
+  aggregate.py    aggregate listing / interactive selection
+  access.py       client access info block (LIFs, mount point, firewall)
+  cohesity.py     Cohesity client + protect/unprotect/status
+  util.py         small shared helpers
+tests/            pytest suite (ssh, HTTP and prompts are all faked)
+bin/netapp        launcher for running from a checkout
+```
+
+Run the tests with `pip install -e '.[dev]' && pytest`.
 
 ## Commands
 

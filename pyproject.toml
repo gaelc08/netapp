@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netapp"
+dynamic = ["version"]
+description = "NetApp ONTAP volume management CLI with Cohesity backup registration"
+requires-python = ">=3.8"
+dependencies = ["requests>=2.28,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+netapp = "netapp.cli:main"
+
+[tool.setuptools]
+packages = ["netapp"]
+
+[tool.setuptools.dynamic]
+version = {attr = "netapp.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
