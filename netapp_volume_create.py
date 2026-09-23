@@ -364,6 +364,20 @@ def get_svm_lifs(args):
     return [row[0] for row in rows if row[0]]
 
 
+def format_bytes_human(n):
+    """Formats a byte count the way ONTAP's own CLI tables do (e.g. "1.75TB",
+    "512MB") instead of a raw byte integer. Passes through anything that
+    isn't a plain number (e.g. the "-" placeholder for a missing value)."""
+    try:
+        size = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(size) < 1024.0 or unit == "PB":
+            return f"{int(size)}{unit}" if unit == "B" else f"{size:.2f}{unit}"
+        size /= 1024.0
+
+
 def list_aggregates_rest(args):
     """REST equivalent of "storage aggregate show", using the well-documented
     GET /api/storage/aggregates collection endpoint."""
@@ -376,12 +390,15 @@ def list_aggregates_rest(args):
 
     records = body.get("records", [])
     name_width = max([len("Aggregate")] + [len(rec.get("name", "-")) for rec in records]) + 2
-    lines = [f"{'Aggregate':<{name_width}}{'Size':>14}{'Available':>14}{'Used':>14}  {'State':<10}{'Vols':>6}"]
+    lines = [f"{'Aggregate':<{name_width}}{'Size':>12}{'Available':>12}{'Used':>12}  {'State':<10}{'Vols':>6}"]
     for rec in records:
         block = (rec.get("space") or {}).get("block_storage") or {}
         lines.append(
-            f"{rec.get('name', '-'):<{name_width}}{block.get('size', '-'):>14}{block.get('available', '-'):>14}"
-            f"{block.get('used', '-'):>14}  {rec.get('state', '-'):<10}{rec.get('volume_count', '-'):>6}"
+            f"{rec.get('name', '-'):<{name_width}}"
+            f"{format_bytes_human(block.get('size', '-')):>12}"
+            f"{format_bytes_human(block.get('available', '-')):>12}"
+            f"{format_bytes_human(block.get('used', '-')):>12}"
+            f"  {rec.get('state', '-'):<10}{rec.get('volume_count', '-'):>6}"
         )
     return "\n".join(lines) + "\n"
 
