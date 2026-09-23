@@ -110,6 +110,14 @@ standalone via `volume backup` for retrying a registration that failed the
 first time. Auth is `--cohesity-apikey`, or `$COHESITY_APIKEY`, or a hidden
 prompt.
 
+TLS to the Cohesity API is verified by default, same as ONTAP REST. If the
+Cohesity clusters present an internal-CA certificate, point at that CA with
+`--cohesity-ca-bundle <path>` or, more conveniently, `export
+COHESITY_CA_BUNDLE=<path>` once in your shell profile. `--insecure-cohesity`
+skips verification entirely (not recommended; the API key is sent with
+every request). A verification failure is reported explicitly rather than
+as a generic "could not fetch" warning.
+
 The Cohesity cluster and job name are derived from `--cluster` and
 `--backup-tier`:
 

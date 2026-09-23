@@ -22,16 +22,28 @@ class CohesityClient:
     helpers return None (never raise) on any connection or decoding error,
     so callers can degrade to a warning."""
 
-    def __init__(self, cluster, apikey, verify=False):
+    def __init__(self, cluster, apikey, verify=True):
         self.cluster = cluster
         self.apikey = apikey
         self.verify = verify
         self.base_url = f"https://{cluster}/irisservices/api/v1/public"
+        self._tls_hint_shown = False
 
     def request(self, method, path, **kwargs):
         headers = kwargs.pop("headers", {})
         headers["apiKey"] = self.apikey
-        return requests.request(method, f"{self.base_url}{path}", headers=headers, verify=self.verify, timeout=30, **kwargs)
+        try:
+            return requests.request(method, f"{self.base_url}{path}", headers=headers, verify=self.verify, timeout=30, **kwargs)
+        except requests.exceptions.SSLError as exc:
+            # Every caller degrades a failed call to a generic "could not
+            # fetch ..." warning, which would hide the real cause - say it
+            # once, with the fix.
+            if not self._tls_hint_shown:
+                self._tls_hint_shown = True
+                print(f"[WARN] TLS verification of {self.cluster} failed: {exc}", file=sys.stderr)
+                print("[WARN] If it uses an internal CA, pass --cohesity-ca-bundle <path> (or set $COHESITY_CA_BUNDLE); "
+                      "--insecure-cohesity skips verification (not recommended).", file=sys.stderr)
+            raise
 
     def json(self, method, path, **kwargs):
         try:
@@ -174,8 +186,20 @@ def get_cohesity_apikey(args, cohesity_cluster):
     return apikey
 
 
+def cohesity_tls_verify(args):
+    """requests' `verify` for Cohesity: verified by default (against the
+    system CA store, or --cohesity-ca-bundle / $COHESITY_CA_BUNDLE), False
+    only with an explicit --insecure-cohesity."""
+    if getattr(args, "cohesity_insecure", False):
+        return False
+    ca_bundle = getattr(args, "cohesity_ca_bundle", None) or os.environ.get("COHESITY_CA_BUNDLE")
+    if ca_bundle and not os.path.isfile(ca_bundle):
+        error_exit(f"Cohesity CA bundle '{ca_bundle}' does not exist")
+    return ca_bundle or True
+
+
 def connect(args, cohesity_cluster):
-    return CohesityClient(cohesity_cluster, get_cohesity_apikey(args, cohesity_cluster))
+    return CohesityClient(cohesity_cluster, get_cohesity_apikey(args, cohesity_cluster), verify=cohesity_tls_verify(args))
 
 
 def iter_netapp_job_details(client, jobs_raw):

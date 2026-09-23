@@ -5,7 +5,7 @@ import sys
 
 from . import __version__, cohesity, rollback, volume
 from .aggregate import list_aggregates, select_aggregate_interactively
-from .util import error_exit
+from .util import error_exit, silence_insecure_request_warnings
 from .validation import parse_size, validate_inputs
 
 TOP_DESCRIPTION = """\
@@ -71,6 +71,10 @@ Cohesity backup (volume create/check/backup):
   [--cohesity-apikey <apikey>]            falls back to $COHESITY_APIKEY, then a prompt
   [--cohesity-cluster <name>]             override auto-detected Cohesity cluster
   [--cohesity-job <name>]                 override auto-built job name
+  [--cohesity-ca-bundle <path>]           trust a private/internal CA for the Cohesity API
+                                          (falls back to $COHESITY_CA_BUNDLE; default:
+                                          normal TLS verification)
+  [--insecure-cohesity]                   skip TLS verification for Cohesity - not recommended
   [--no-backup]                           (create only) skip Cohesity protection entirely
 
 The Cohesity cluster and job name are derived from --cluster and --backup-tier:
@@ -121,6 +125,8 @@ def _cohesity_parser():
     p.add_argument("--cohesity-apikey", dest="cohesity_apikey")
     p.add_argument("--cohesity-cluster", dest="cohesity_cluster_override")
     p.add_argument("--cohesity-job", dest="cohesity_job_override")
+    p.add_argument("--cohesity-ca-bundle", dest="cohesity_ca_bundle")
+    p.add_argument("--insecure-cohesity", dest="cohesity_insecure", action="store_true")
     return p
 
 
@@ -234,6 +240,9 @@ def main(argv=None):
         args.comment = "Created by netapp_volume script"
     if not getattr(args, "export_policy", None):
         args.export_policy = getattr(args, "volume_name", None)
+
+    if getattr(args, "ontap_insecure", False) or getattr(args, "cohesity_insecure", False):
+        silence_insecure_request_warnings()
 
     if args.api_mode not in ("ssh", "rest"):
         error_exit(f"--api must be ssh or rest (got '{args.api_mode}')")

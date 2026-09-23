@@ -62,3 +62,61 @@ def test_backup_unmapped_cluster_is_skipped(fakes, capsys):
         main(["volume", "backup", "--cluster", "elsewhere", "--svm", "s", "--volume", "v", "--backup-tier", "short"])
     assert fakes.http_calls() == []
     assert "No known Cohesity mapping" in capsys.readouterr().err
+
+
+# ── TLS verification ────────────────────────────────────────────────────────
+
+def _cohesity_verify_values(fakes):
+    return {c[3]["verify"] for c in fakes.http_calls() if "irisservices" in c[2]}
+
+
+def test_tls_verified_by_default(fakes):
+    _cohesity(fakes)
+    with pytest.raises(SystemExit):
+        main(BACKUP)
+    assert _cohesity_verify_values(fakes) == {True}
+
+
+def test_ca_bundle_flag(fakes, tmp_path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("x")
+    _cohesity(fakes)
+    with pytest.raises(SystemExit):
+        main(BACKUP + ["--cohesity-ca-bundle", str(ca)])
+    assert _cohesity_verify_values(fakes) == {str(ca)}
+
+
+def test_ca_bundle_env(fakes, tmp_path, monkeypatch):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("x")
+    monkeypatch.setenv("COHESITY_CA_BUNDLE", str(ca))
+    _cohesity(fakes)
+    with pytest.raises(SystemExit):
+        main(BACKUP)
+    assert _cohesity_verify_values(fakes) == {str(ca)}
+
+
+def test_missing_ca_bundle_is_an_error(fakes, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(BACKUP + ["--cohesity-ca-bundle", "/nope/ca.pem"])
+    assert exc.value.code == 1
+    assert "Cohesity CA bundle '/nope/ca.pem' does not exist" in capsys.readouterr().err
+    assert fakes.http_calls() == []
+
+
+def test_insecure_opt_out(fakes):
+    _cohesity(fakes)
+    with pytest.raises(SystemExit):
+        main(BACKUP + ["--insecure-cohesity"])
+    assert _cohesity_verify_values(fakes) == {False}
+
+
+def test_tls_failure_explains_the_fix_once(fakes, capsys):
+    import requests
+    fakes.on_http("GET", "/protectionJobs", raises=requests.exceptions.SSLError("certificate verify failed"))
+    with pytest.raises(SystemExit):
+        main(BACKUP)
+    err = capsys.readouterr().err
+    assert err.count("TLS verification of closluce-1 failed") == 1
+    assert "--cohesity-ca-bundle" in err
+    assert "Could not fetch protection jobs" in err

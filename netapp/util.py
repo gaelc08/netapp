@@ -9,8 +9,6 @@ from .constants import DOMAIN
 # instead of failing at import time.
 try:
     import requests
-    from requests.packages.urllib3.exceptions import InsecureRequestWarning
-    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
     HAVE_REQUESTS = True
 except ImportError:
     requests = None
@@ -20,6 +18,16 @@ except ImportError:
 def error_exit(message):
     print(f"[ERROR] {message}", file=sys.stderr)
     sys.exit(1)
+
+
+def silence_insecure_request_warnings():
+    """Called only when the user explicitly opted out of TLS verification
+    (--insecure-ontap / --insecure-cohesity): don't spam a warning per
+    request for a choice made on purpose. With verification on, urllib3's
+    warnings stay enabled."""
+    if HAVE_REQUESTS:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def remote_host(cluster):
