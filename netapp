@@ -6,7 +6,7 @@ optional Cohesity backup registration. Originally a straight Python port of
 netapp_volume_create.sh; restructured from single-purpose flags (--delete,
 --check, --backup-only, --list-aggregates) into subcommands once it grew
 past "just create volumes".
-Version: 2026-09-23-08 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
+Version: 2026-09-23-09 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
 """
 
 import argparse
@@ -26,7 +26,7 @@ try:
 except ImportError:
     HAVE_REQUESTS = False
 
-SCRIPT_VERSION = "2026-09-23-08"
+SCRIPT_VERSION = "2026-09-23-09"
 
 # LIF addresses on this network are reserved for Cohesity backup traffic
 # and must never be handed out to clients as a mount target - excluded
@@ -1193,7 +1193,7 @@ def refresh_cohesity_netapp_source(cohesity_cluster, apikey, cluster):
     try:
         resp = cohesity_request(
             "POST",
-            f"https://{cohesity_cluster}/irisservices/api/v1/public/protectionSources/refresh?id={cluster_source_id}",
+            f"https://{cohesity_cluster}/irisservices/api/v1/public/protectionSources/refresh/{cluster_source_id}",
             apikey,
         )
         http_code = resp.status_code
