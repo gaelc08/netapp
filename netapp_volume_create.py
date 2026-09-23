@@ -375,11 +375,12 @@ def list_aggregates_rest(args):
         error_exit(f"Could not fetch aggregate list from {args.cluster} (HTTP {status}): {body.get('message', '')}")
 
     records = body.get("records", [])
-    lines = [f"{'Aggregate':<20}{'Size':>14}{'Available':>14}{'Used':>14}  {'State':<10}{'Vols':>6}"]
+    name_width = max([len("Aggregate")] + [len(rec.get("name", "-")) for rec in records]) + 2
+    lines = [f"{'Aggregate':<{name_width}}{'Size':>14}{'Available':>14}{'Used':>14}  {'State':<10}{'Vols':>6}"]
     for rec in records:
         block = (rec.get("space") or {}).get("block_storage") or {}
         lines.append(
-            f"{rec.get('name', '-'):<20}{block.get('size', '-'):>14}{block.get('available', '-'):>14}"
+            f"{rec.get('name', '-'):<{name_width}}{block.get('size', '-'):>14}{block.get('available', '-'):>14}"
             f"{block.get('used', '-'):>14}  {rec.get('state', '-'):<10}{rec.get('volume_count', '-'):>6}"
         )
     return "\n".join(lines) + "\n"
