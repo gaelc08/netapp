@@ -2,7 +2,7 @@
 """netapp_volume_create.py
 
 Python port of netapp_volume_create.sh.
-Version: 2026-09-23-04 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
+Version: 2026-09-23-05 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
 """
 
 import argparse
@@ -22,7 +22,7 @@ try:
 except ImportError:
     HAVE_REQUESTS = False
 
-SCRIPT_VERSION = "2026-09-23-04"
+SCRIPT_VERSION = "2026-09-23-05"
 
 # LIF addresses on this network are reserved for Cohesity backup traffic
 # and must never be handed out to clients as a mount target - excluded
@@ -216,6 +216,10 @@ def resolve_ontap_auth(args):
         password = getpass.getpass(f"ONTAP password for {args.user}@{args.cluster}: ")
         if not password:
             error_exit("No ONTAP password provided")
+        # Cache it on args so the many REST calls in one run (including a
+        # job-poll loop that can hit this every 2 seconds) reuse it instead
+        # of prompting again and again.
+        args.ontap_password = password
 
     return {"auth": (args.user, password)}
 
