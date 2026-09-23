@@ -22,7 +22,7 @@ try:
 except ImportError:
     HAVE_REQUESTS = False
 
-SCRIPT_VERSION = "2026-09-23-02"
+SCRIPT_VERSION = "2026-09-23-03"
 
 # LIF addresses on this network are reserved for Cohesity backup traffic
 # and must never be handed out to clients as a mount target - excluded
@@ -97,6 +97,23 @@ to, so no Cohesity API key is needed for a dry run. Read-only lookups (e.g.
 looking up an existing volume before a delete, or SVM LIF addresses for the
 client access info block) still run for real, since they make no changes.
 
+--api <ssh|rest> selects how ONTAP itself is reached. ssh (the default) runs
+the same CLI commands an admin would type by hand - this is the only fully
+implemented path. rest talks to ONTAP's REST API over HTTPS instead, but is
+currently only implemented for --list-aggregates; every other mode rejects
+--api rest until its REST calls are verified against a real cluster.
+
+ONTAP REST authentication (only relevant with --api rest), tried in order:
+          1. Client certificate, if configured:
+             [--cert-file <path>] [--key-file <path>]
+             (or $ONTAP_CERT_FILE / $ONTAP_KEY_FILE) - both are required
+             together. The certificate must already be installed in ONTAP
+             and mapped to a user (security login create -authmethod cert).
+          2. HTTP basic auth otherwise, using --user plus:
+             [--password <password>]           (falls back to $ONTAP_PASSWORD, then a prompt)
+          [--ca-bundle <path>]                  (trust a private/internal CA; default is normal TLS verification)
+          [--insecure-ontap]                    (skip TLS verification entirely - not recommended)
+
 Cohesity backup (on by default after volume creation, use --no-backup to skip):
           [--backup-tier <short|mid|long|none>]   (prompted interactively if omitted; 'none' = skip)
           [--cohesity-apikey <apikey>]        (falls back to $COHESITY_APIKEY, then a prompt)
@@ -147,7 +164,98 @@ def ssh_capture(user, cluster, remote_cmd, combine_stderr=False):
     return result
 
 
-def list_aggregates(user, cluster):
+# ── ONTAP REST API (opt-in via --api rest) ──────────────────────────────────
+# Everything above (and the rest of the script) talks to ONTAP over ssh,
+# running the same CLI commands an admin would type by hand - that's the
+# default and the only fully implemented path. --api rest is an opt-in,
+# still-partial alternative that talks to ONTAP's REST API over HTTPS
+# instead. Only read-only aggregate listing is implemented on REST so far;
+# volume/export-policy/quota mutations have NOT been ported to REST (their
+# exact field names need verifying against the target cluster's ONTAP
+# version before it's safe to write production code against them) and
+# --api rest is rejected for those modes rather than silently falling back
+# to ssh or guessing.
+#
+# Authentication (in this order):
+#   1. Client certificate, if configured: --cert-file/--key-file, or
+#      $ONTAP_CERT_FILE/$ONTAP_KEY_FILE. Requires the cert already installed
+#      in ONTAP and mapped to a user via
+#      "security login create -authmethod cert -application http ...".
+#      See: https://docs.netapp.com/us-en/ontap-technical-reports/ontap-security-hardening/set-up-certificate-based-api-access.html
+#   2. HTTP basic auth otherwise, using --user plus --password, or
+#      $ONTAP_PASSWORD, or (if neither is given) a hidden interactive prompt
+#      - the same fallback chain already used for the Cohesity API key.
+def resolve_ontap_auth(args):
+    """Returns a dict of kwargs to merge into a requests call: either
+    {"cert": (cert_file, key_file)} for client-certificate auth, or
+    {"auth": (user, password)} for HTTP basic auth."""
+    cert_file = getattr(args, "ontap_cert_file", None) or os.environ.get("ONTAP_CERT_FILE")
+    key_file = getattr(args, "ontap_key_file", None) or os.environ.get("ONTAP_KEY_FILE")
+
+    if cert_file and key_file:
+        if not os.path.isfile(cert_file):
+            error_exit(f"--cert-file '{cert_file}' does not exist")
+        if not os.path.isfile(key_file):
+            error_exit(f"--key-file '{key_file}' does not exist")
+        return {"cert": (cert_file, key_file)}
+
+    if cert_file or key_file:
+        error_exit("--cert-file and --key-file must both be given (or neither) for client-certificate auth")
+
+    if not args.user:
+        error_exit("ONTAP REST basic auth requires --user (no client certificate was configured)")
+
+    password = getattr(args, "ontap_password", None) or os.environ.get("ONTAP_PASSWORD")
+    if not password:
+        password = getpass.getpass(f"ONTAP password for {args.user}@{args.cluster}: ")
+        if not password:
+            error_exit("No ONTAP password provided")
+
+    return {"auth": (args.user, password)}
+
+
+def ontap_rest_request(args, method, path, **kwargs):
+    """Issues one ONTAP REST call against --cluster. TLS is verified by
+    default; pass --ca-bundle for an internal/self-signed CA, or
+    --insecure-ontap to skip verification (not recommended)."""
+    if not HAVE_REQUESTS:
+        error_exit("Python 'requests' package not found - required for --api rest (pip install requests)")
+
+    auth_kwargs = resolve_ontap_auth(args)
+    if getattr(args, "ontap_insecure", False):
+        verify = False
+    else:
+        verify = getattr(args, "ontap_ca_bundle", None) or True
+
+    url = f"https://{remote_host(args.cluster)}/api{path}"
+    try:
+        return requests.request(method, url, timeout=30, verify=verify, headers={"Accept": "application/json"}, **auth_kwargs, **kwargs)
+    except requests.RequestException as exc:
+        error_exit(f"ONTAP REST request to {url} failed: {exc}")
+
+
+def list_aggregates_rest(args):
+    """REST equivalent of "storage aggregate show", using the well-documented
+    GET /api/storage/aggregates collection endpoint."""
+    resp = ontap_rest_request(
+        args, "GET", "/storage/aggregates",
+        params={"fields": "space.block_storage.size,space.block_storage.available,space.block_storage.used,state,volume_count"},
+    )
+    if resp.status_code != 200:
+        error_exit(f"Could not fetch aggregate list from {args.cluster} (HTTP {resp.status_code}): {resp.text}")
+
+    records = resp.json().get("records", [])
+    lines = [f"{'Aggregate':<20}{'Size':>14}{'Available':>14}{'Used':>14}  {'State':<10}{'Vols':>6}"]
+    for rec in records:
+        block = (rec.get("space") or {}).get("block_storage") or {}
+        lines.append(
+            f"{rec.get('name', '-'):<20}{block.get('size', '-'):>14}{block.get('available', '-'):>14}"
+            f"{block.get('used', '-'):>14}  {rec.get('state', '-'):<10}{rec.get('volume_count', '-'):>6}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def list_aggregates_ssh(user, cluster):
     """Raw ONTAP tabular output: Aggregate, Size, Available, Used%, State,
     #Vols, Nodes, RAID Status - already includes TB occupancy and volume
     count per aggregate."""
@@ -157,11 +265,17 @@ def list_aggregates(user, cluster):
     return result.stdout.replace("\r", "")
 
 
-def select_aggregate_interactively(user, cluster):
+def list_aggregates(args):
+    if getattr(args, "api_mode", "ssh") == "rest":
+        return list_aggregates_rest(args)
+    return list_aggregates_ssh(args.user, args.cluster)
+
+
+def select_aggregate_interactively(args):
     print("", file=sys.stderr)
-    print(f"No --aggregate given. Current aggregate occupancy on {cluster}:", file=sys.stderr)
+    print(f"No --aggregate given. Current aggregate occupancy on {args.cluster}:", file=sys.stderr)
     print("", file=sys.stderr)
-    print(list_aggregates(user, cluster), file=sys.stderr)
+    print(list_aggregates(args), file=sys.stderr)
     print("", file=sys.stderr)
     aggregate = input("Enter the aggregate name to use: ").strip()
     if not aggregate:
@@ -938,6 +1052,12 @@ def build_parser():
     parser.add_argument("--delete", dest="delete_mode", action="store_true")
     parser.add_argument("--yes", dest="assume_yes", action="store_true")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true")
+    parser.add_argument("--api", dest="api_mode", default="ssh")
+    parser.add_argument("--cert-file", dest="ontap_cert_file")
+    parser.add_argument("--key-file", dest="ontap_key_file")
+    parser.add_argument("--password", dest="ontap_password")
+    parser.add_argument("--ca-bundle", dest="ontap_ca_bundle")
+    parser.add_argument("--insecure-ontap", dest="ontap_insecure", action="store_true")
     parser.add_argument("-h", "--help", action="store_true", dest="show_help")
     parser.add_argument("--version", action="store_true")
     return parser
@@ -972,28 +1092,33 @@ def main(argv=None):
     if not args.export_policy:
         args.export_policy = args.volume_name
 
+    if args.api_mode not in ("ssh", "rest"):
+        error_exit(f"--api must be ssh or rest (got '{args.api_mode}')")
+
     if args.dry_run:
         print("[INFO] --dry-run: no ONTAP or Cohesity changes will be made. Commands that would run are printed with a [DRY-RUN] prefix.")
 
     # --list-aggregates: just show occupancy and exit, no volume created
     if args.list_aggregates_only:
         require_args(args, ["user", "cluster"])
-        print(list_aggregates(args.user, args.cluster), end="")
+        print(list_aggregates(args), end="")
         sys.exit(0)
 
     # --delete: remove a volume (and its export-policy, if safe) and exit
     if args.delete_mode:
         require_args(args, ["user", "cluster", "svm_name", "volume_name"])
+        if args.api_mode == "rest":
+            error_exit("--api rest is currently only implemented for --list-aggregates; use --api ssh (the default) for --delete.")
         delete_volume(args)
         sys.exit(0)
 
     # --backup-only: register an ALREADY-EXISTING volume with Cohesity and
-    # exit - no ONTAP call is made at all. This is the recovery path if
-    # volume creation succeeded but the Cohesity step failed/was skipped
-    # (bad --cohesity-apikey, job not found yet, etc.) - re-running the full
-    # create command in that situation just fails on "export-policy already
-    # exists". --user is intentionally not required here since nothing
-    # touches ONTAP in this mode.
+    # exit - no ONTAP call is made at all (--api is irrelevant here). This
+    # is the recovery path if volume creation succeeded but the Cohesity
+    # step failed/was skipped (bad --cohesity-apikey, job not found yet,
+    # etc.) - re-running the full create command in that situation just
+    # fails on "export-policy already exists". --user is intentionally not
+    # required here since nothing touches ONTAP in this mode.
     if args.backup_only:
         require_args(args, ["cluster", "svm_name", "volume_name"])
         if args.no_backup:
@@ -1004,6 +1129,8 @@ def main(argv=None):
     # --check: read-only status report (ONTAP + Cohesity), no changes made
     if args.check_mode:
         require_args(args, ["user", "cluster", "svm_name", "volume_name"])
+        if args.api_mode == "rest":
+            error_exit("--api rest is currently only implemented for --list-aggregates; use --api ssh (the default) for --check.")
         check_volume_status(args)
         sys.exit(0)
 
@@ -1011,12 +1138,15 @@ def main(argv=None):
     # missing, we prompt interactively below instead of failing)
     require_args(args, ["volume_type", "user", "cluster", "svm_name", "volume_name", "vol_size", "snap_policy"])
 
+    if args.api_mode == "rest":
+        error_exit("--api rest is currently only implemented for --list-aggregates; use --api ssh (the default) for volume creation.")
+
     # Parse --size into size_num / size_unit (accepts "100" or "100GB")
     size_num, size_unit = parse_size(args.vol_size)
 
     # If no aggregate given, show occupancy and ask which one to use
     if not args.aggregate:
-        args.aggregate = select_aggregate_interactively(args.user, args.cluster)
+        args.aggregate = select_aggregate_interactively(args)
 
     validate_inputs(args)
 
