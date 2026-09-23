@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff>=0.15,<0.16"]
 
 [project.scripts]
 netapp = "netapp.cli:main"
@@ -33,3 +33,9 @@ testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py38"
+
+[tool.ruff.lint]
+# Pinned explicitly (ruff's default rule set changes between releases):
+# syntax errors, undefined/unused names and other likely bugs, no style
+# rules.
+select = ["E4", "E7", "E9", "F"]
