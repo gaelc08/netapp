@@ -2,7 +2,7 @@
 """netapp_volume_create.py
 
 Python port of netapp_volume_create.sh.
-Version: 2026-09-23-01 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
+Version: 2026-09-23-02 (Python port of bash SCRIPT_VERSION 2026-09-09-17)
 """
 
 import argparse
@@ -22,7 +22,7 @@ try:
 except ImportError:
     HAVE_REQUESTS = False
 
-SCRIPT_VERSION = "2026-09-23-01"
+SCRIPT_VERSION = "2026-09-23-02"
 
 # LIF addresses on this network are reserved for Cohesity backup traffic
 # and must never be handed out to clients as a mount target - excluded
@@ -88,6 +88,14 @@ Also: %(prog)s --check --user <username> --cluster <source_cluster> --svm <svm_n
 --tiering-policy is optional and OMITTED by default (volume keeps the aggregate's
 own tiering behavior). Only pass it on FabricPool-enabled aggregates/clusters -
 ONTAP rejects -tiering-policy on an aggregate with no object store attached.
+
+--dry-run works with volume creation, --delete, and --backup-only. It prints
+every ONTAP command that would be run (and, for --delete, skips the
+confirmation prompt) instead of sending it over ssh, and skips all Cohesity
+API calls entirely - it just prints which job the volume would be registered
+to, so no Cohesity API key is needed for a dry run. Read-only lookups (e.g.
+looking up an existing volume before a delete, or SVM LIF addresses for the
+client access info block) still run for real, since they make no changes.
 
 Cohesity backup (on by default after volume creation, use --no-backup to skip):
           [--backup-tier <short|mid|long|none>]   (prompted interactively if omitted; 'none' = skip)
@@ -219,8 +227,15 @@ def run_step(args, description, remote_cmd):
     """Executes a single remote command, checking its actual exit status
     (unlike chaining several ONTAP commands in one ssh call, where only the
     last command's exit status is visible). Prints the remote command's
-    output either way. Returns True on success."""
+    output either way. Returns True on success.
+
+    In --dry-run mode, nothing is actually sent over ssh - the command that
+    would have run is printed instead, and success is simulated so the rest
+    of the flow (including what it would print) plays out normally."""
     print(f"[INFO] {description}...")
+    if getattr(args, "dry_run", False):
+        print(f"[DRY-RUN] Would run on {args.cluster}: {remote_cmd}")
+        return True
     result = ssh_capture(args.user, args.cluster, remote_cmd)
     if result.stdout:
         sys.stdout.write(result.stdout)
@@ -345,9 +360,12 @@ def print_client_access_info(args, protocol, mount_path, policy_for_lookup=None)
         print("  Protocol unknown - pass --type nfs|cifs (on --check) for protocol-specific access info.")
 
 
-def execute_ssh_commands(user, host, remote_cmd):
+def execute_ssh_commands(user, host, remote_cmd, dry_run=False):
     """Non-critical/read-only "show" commands after a volume is confirmed
     created - failures there are just warnings, nothing to roll back."""
+    if dry_run:
+        print(f"[DRY-RUN] Would run informational lookup on {host}: {remote_cmd}")
+        return
     result = ssh_capture(user, host, remote_cmd)
     if result.stdout:
         sys.stdout.write(result.stdout)
@@ -405,6 +423,7 @@ def create_nfs_volume(args, size_num, size_unit):
         f"export-policy rule show -vserver {args.svm_name} -policyname {args.export_policy} -fields clientmatch,protocol; "
         f"vol show -vserver {args.svm_name} -volume {args.volume_name} -fields total,junction-path; "
         f"net interface show -vserver {args.svm_name} -fields address",
+        dry_run=getattr(args, "dry_run", False),
     )
 
     print_client_access_info(args, "nfs", jct_path, args.export_policy)
@@ -481,7 +500,9 @@ def delete_volume(args):
 
     print(f"[INFO] Found volume '{args.volume_name}' - export-policy: '{policy_name}', junction-path: '{jpath or '-'}'.")
 
-    if not args.assume_yes:
+    if getattr(args, "dry_run", False):
+        print(f"[DRY-RUN] Would prompt to confirm deletion of '{args.volume_name}', then run the steps below.")
+    elif not args.assume_yes:
         print("")
         confirm = input(
             f"Delete volume '{args.volume_name}' on {args.svm_name} ({args.cluster})? This is IRREVERSIBLE. Type DELETE to confirm: "
@@ -670,7 +691,9 @@ def protect_volume_in_cohesity(args):
 
     print(f"[INFO] Registering {args.volume_name} for Cohesity protection...")
 
-    if not HAVE_REQUESTS:
+    dry_run = getattr(args, "dry_run", False)
+
+    if not dry_run and not HAVE_REQUESTS:
         print("[WARN] Python 'requests' package not found - skipping Cohesity protection. Add the volume manually (pip install requests).", file=sys.stderr)
         return
 
@@ -699,6 +722,10 @@ def protect_volume_in_cohesity(args):
             return
         tier_word = {"short": "Short", "mid": "Mid", "long": "Long"}[backup_tier]
         job_name = f"{args.cluster.capitalize()}-{tier_word}Term-{cohesity_suffix}"
+
+    if dry_run:
+        print(f"[DRY-RUN] Would register '{args.volume_name}' with Cohesity job '{job_name}' on cluster '{cohesity_cluster}' (no API calls made, no API key needed).")
+        return
 
     apikey = get_cohesity_apikey(args, cohesity_cluster)
 
@@ -910,6 +937,7 @@ def build_parser():
     parser.add_argument("--list-aggregates", dest="list_aggregates_only", action="store_true")
     parser.add_argument("--delete", dest="delete_mode", action="store_true")
     parser.add_argument("--yes", dest="assume_yes", action="store_true")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true")
     parser.add_argument("-h", "--help", action="store_true", dest="show_help")
     parser.add_argument("--version", action="store_true")
     return parser
@@ -943,6 +971,9 @@ def main(argv=None):
         args.comment = "Created by netapp_volume script"
     if not args.export_policy:
         args.export_policy = args.volume_name
+
+    if args.dry_run:
+        print("[INFO] --dry-run: no ONTAP or Cohesity changes will be made. Commands that would run are printed with a [DRY-RUN] prefix.")
 
     # --list-aggregates: just show occupancy and exit, no volume created
     if args.list_aggregates_only:
