@@ -27,15 +27,15 @@ def print_client_access_info(args, protocol, mount_path, policy_for_lookup=None)
     lifs_str = " ".join(lifs)
 
     if not all_lifs:
-        print("  Could not determine the NAS server address automatically - check manually:")
+        print("  Could not determine the SVM's address automatically - check manually:")
         if getattr(args, "api_mode", "ssh") == "rest":
             print(f"    GET https://{remote_host(args.cluster)}/api/network/ip/interfaces?svm.name={args.svm_name}&fields=ip.address")
         else:
             print(f'    ssh -l {args.user} {remote_host(args.cluster)} "net interface show -vserver {args.svm_name} -fields address"')
     elif not lifs:
-        print(f"  No client-facing NAS server address available for {args.svm_name} - check the SVM's LIF configuration.")
+        print(f"  No client-facing address available for SVM {args.svm_name} - check its LIF configuration.")
     else:
-        print(f"  NAS server address: {lifs_str}")
+        print(f"  SVM address: {lifs_str}")
 
     if protocol == "nfs":
         cm = getattr(args, "client_match", None) or ""
@@ -53,7 +53,7 @@ def print_client_access_info(args, protocol, mount_path, policy_for_lookup=None)
         print("  The connection must be opened FROM the client's server(s) TOWARD the SVM's IP")
         print("  (not the other way around):")
         print(f"    Source      (client server(s)): {cm or '<client IP(s)>'}")
-        print(f"    Destination (SVM / NAS server) : {lifs_str or '<see above>'}")
+        print(f"    Destination (SVM)             : {lifs_str or '<see above>'}")
         print("  The client will not be able to mount until that's open.")
     elif protocol == "cifs":
         print(f"  Junction-path (share target): {mount_path}")
@@ -63,7 +63,7 @@ def print_client_access_info(args, protocol, mount_path, policy_for_lookup=None)
         print("  The connection must be opened FROM the client's server(s) TOWARD the SVM's IP")
         print("  (not the other way around):")
         print("    Source      (client server(s)): <client IP(s) that need access>")
-        print(f"    Destination (SVM / NAS server) : {lifs_str or '<see above>'}")
+        print(f"    Destination (SVM)             : {lifs_str or '<see above>'}")
         print("  The client will not be able to connect until that's open. If no CIFS")
         print("  share exists yet on this junction-path, one must be created first.")
     else:
